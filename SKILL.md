@@ -5,7 +5,7 @@ description: This skill should be used when the user asks to "summarise my call"
 
 # Granola transcript summarisation
 
-This skill extracts raw meeting transcripts from the Granola app and creates custom summaries.
+This skill extracts raw meeting transcripts from the Granola app, creates tidied transcripts and structured summaries, files them to the relevant project, and optionally adds summaries to a shared Google Doc, sends call notes via email, or sends them as a Slack DM.
 
 **Update check:** Before starting, run `bash ~/.claude/skills/summarise-granola/scripts/check-update.sh`. If it prints output, show the message and ask the user which action to take:
 - **Update now** — run `bash ~/.claude/skills/summarise-granola/scripts/update-skill.sh`, then re-read this SKILL.md before continuing

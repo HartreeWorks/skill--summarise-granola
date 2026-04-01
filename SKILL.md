@@ -404,9 +404,11 @@ Show the user a preview of the email and ask for confirmation before sending.
 1. **Find the person's Slack DM channel:**
    - Check `people.json` for a `slack_dm_channel` field on the person's entry
    - The field is an object: `{"channel_id": "D...", "workspace": "type3ltd", "slack_connect": true}`
-   - If not found, use the Slack skill's `slack_client.py` to find the DM channel:
-     - Try each workspace: `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> channels "im"`
-     - Match by user ID against known Slack search results
+   - If found, use it directly (skip to step 2)
+   - If not found, use the Slack skill's `slack_client.py` to search for the person:
+     - Run `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> users` and parse the JSON
+     - **Full name verification (CRITICAL):** Match against `real_name` (full name), NOT just `name` or first name. The person's full name from the meeting title must exactly match a workspace member's `real_name`. If no exact full-name match is found, do NOT proceed—ask the user to identify the correct person. This prevents sending messages to the wrong person when multiple users share a first name.
+     - Once the correct user is identified, find their DM channel via `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> channels "im"` and match by user ID
    - Cache the full object in `people.json` under the person's `slack_dm_channel` field for future use
 
 2. **Compose message** using Slack mrkdwn formatting — keep it brief (no greeting or sign-off):
@@ -423,7 +425,7 @@ Show the user a preview of the email and ask for confirmation before sending.
      <user's comment>
      ```
 
-3. **Show preview and ask for confirmation** before sending (same pattern as the email step).
+3. **Show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith** on type3ltd?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
 
 4. **Send via Slack** (always pass `--workspace` from the cached entry):
    ```bash

@@ -79,9 +79,16 @@ Provide a free-text input option since participant names can't be predicted.
 
 **Store the confirmed names** and use them consistently throughout the tidied transcript and summary.
 
-### Step 3: Create tidied transcript
+### Step 3: Create tidied transcript and summary (parallel)
 
-Create a cleaned-up version of the transcript and save it to `data/tidied-transcripts/` using the same filename.
+Launch **two Agent tool calls in a single message** to run the tidied transcript and summary concurrently. Both agents work from the **raw transcript**—the summary does not depend on the tidied transcript.
+
+**Agent 1: Tidied transcript** (`model: "sonnet"`)
+
+Prompt the agent with the full raw transcript text, the confirmed participant names, and the instructions below. The agent must write the result to `data/tidied-transcripts/` using the same filename as the raw transcript.
+
+<details>
+<summary>Tidying instructions (include in agent prompt)</summary>
 
 **Tidying guidelines:**
 
@@ -116,15 +123,21 @@ Create a cleaned-up version of the transcript and save it to `data/tidied-transc
 - Put direct quotes in "quotation marks"
 - Use bullet points for lists or multiple related points
 
-### Step 4: Create and save the summary
+</details>
 
-Create a comprehensive summary and save it to `data/summaries/` using the same filename as the transcript.
+**Agent 2: Summary** (`model: "opus"`)
 
-### Step 5: Associate with project
+Prompt the agent with the full raw transcript text, the confirmed participant names, and the complete summary format guidelines from the "Summary format" section of this skill file. The agent must write the result to `data/summaries/` using the same filename as the transcript.
+
+**Important:** Both agents must receive the full formatting guidelines in their prompt—they do not have access to this skill file.
+
+**Only the summary (Agent 2) blocks progression.** The tidied transcript is for reference only—launch Agent 1 with `run_in_background: true` and proceed to Step 4 as soon as the summary agent completes. The tidied transcript will finish on its own; if it's not done by Step 4d (copy files to project), wait for it then.
+
+### Step 4: Associate with project
 
 Immediately after creating the summary, determine if this call should be associated with a project.
 
-**Step 5a: Check the people registry**
+**Step 4a: Check the people registry**
 
 1. Extract the other participant's name from the meeting title (the person who isn't the user)
 2. Convert to registry key format: lowercase, hyphenated (e.g., "Jane Smith" → "jane-smith")
@@ -134,14 +147,14 @@ Immediately after creating the summary, determine if this call should be associa
    ```
 4. Check if the key exists in `people` and has a `default_project` value
 
-**Step 5b: If person is registered → auto-associate**
+**Step 4b: If person is registered → auto-associate**
 
 If found in the registry:
 1. Get the `default_project` value
 2. Silently associate with that project (no confirmation needed)
-3. Note the auto-association for the final output (Step 6)
+3. Note the auto-association for the final output (Step 5)
 
-**Step 5c: If person is NOT registered → show project list**
+**Step 4c: If person is NOT registered → show project list**
 
 If not found in the registry, fall back to the full project selection:
 
@@ -153,7 +166,7 @@ Filter to only `status: "active"` projects and present options using AskUserQues
 - List each active project as an option (e.g., "80000 Hours advisory")
 - Include a "None" option for calls not associated with any project
 
-**Step 5d: Copy files to project**
+**Step 4d: Copy files to project**
 
 For both auto-associated and manually selected projects:
 
@@ -172,7 +185,7 @@ cp ~/.claude/skills/summarise-granola/data/summaries/2026-01-06-meeting--summary
 cp ~/.claude/skills/summarise-granola/data/tidied-transcripts/2026-01-06-meeting--transcript.md ~/Documents/Projects/2026-01-80000-hours-advisory/calls/transcripts/
 ```
 
-**Step 5e: Offer to register unregistered people**
+**Step 4e: Offer to register unregistered people**
 
 If the user selected a project for someone NOT in the registry, offer to add them:
 
@@ -182,7 +195,7 @@ If yes, update `people.json` to add or update the entry with the `default_projec
 
 **If user selects "None":** No additional action needed, and don't offer registration.
 
-### Step 6: Report saved files and open them
+### Step 5: Report saved files and open them
 
 When reporting the files saved, always use **full expanded paths** (not relative paths or paths with `~`). This allows the user to control-click/command-click on the path in their terminal to open the file.
 
@@ -217,14 +230,14 @@ After copying files to a project, open the summary file:
 open "/Users/username/Documents/Projects/acme-consulting/calls/summaries/2026-01-09-meeting--summary.md"
 ```
 
-### Step 7: Offer to add summary to meeting doc and/or send call notes
+### Step 6: Offer to add summary to meeting doc and/or send call notes
 
 **Skip this step for:**
 - Group meetings (more than 2 participants)
 - Meetings without a clear person name
 - Internal meetings or solo sessions
 
-**Step 7a: Ask what the user wants to do**
+**Step 6a: Ask what the user wants to do**
 
 Use AskUserQuestion with `multiSelect: true`:
 
@@ -235,7 +248,7 @@ Use AskUserQuestion with `multiSelect: true`:
 
 If the user selects neither (just "Skip"), stop here.
 
-**Step 7b: Add summary to Google Doc** (if selected)
+**Step 6b: Add summary to Google Doc** (if selected)
 
 1. **Look up the meeting doc:**
    - Extract the other participant's initials from their name (e.g., "Matt Brooks" → "mb")
@@ -257,8 +270,8 @@ If the user selects neither (just "Skip"), stop here.
    ```
    The anchor must exactly match text in the tab. Do NOT include the full tab content.
 
-4. **Create `/tmp/gdoc-new.txt`** — the new summary followed by the anchor:
-   - Read the local summary markdown file (the one saved in Step 4)
+4. **Create `/tmp/gdoc-new.txt`** — use `cat <<'EOF'` via Bash (not the Write tool) to avoid the read-before-write check on temp files:
+   - Read the local summary markdown file (the one saved in Step 3)
    - Strip all `---` horizontal rule lines and collapse surrounding blank lines so there is only one blank line before each heading (Google Docs API cannot render horizontal rules; double blank lines produce unwanted spacing)
    - **Replace the heading block** with just the date as H1. The local markdown file has:
      ```
@@ -276,12 +289,12 @@ If the user selects neither (just "Skip"), stop here.
    - **No blank lines between headings and body text.** Every `##` heading should be immediately followed by the body text on the next line (no blank line in between). Blank lines should only appear *before* headings (to separate sections).
    - **Keep all other markdown formatting intact**: `##` headings, `**bold**`, `- bullet` lists, `1.` numbered lists, `| table |` rows. `gdoc edit` parses the new-file as markdown and converts it to Google Docs formatting (heading styles, bold, bullets, tables with bold headers). If the markdown syntax is missing, the content will appear as unformatted plain text.
    - Append the anchor text as the final line (so the new summary appears above existing content)
-   - Write to `/tmp/gdoc-new.txt`
 
-   - **No blank line between `# YYYY-MM-DD` and the first `## Summary` heading.** The date heading and first section heading should be immediately adjacent.
+   **No blank line between `# YYYY-MM-DD` and the first `## Summary` heading.** The date heading and first section heading should be immediately adjacent.
 
-   Example structure of `/tmp/gdoc-new.txt`:
-   ```
+   Example:
+   ```bash
+   cat <<'EOF' > /tmp/gdoc-new.txt
    # 2026-02-24
    ## Summary
    Peter and JP discussed...
@@ -295,6 +308,7 @@ If the user selects neither (just "Skip"), stop here.
    | JP | "quote" | context |
 
    # 2026-02-19
+   EOF
    ```
 
 5. **Push the edit:**
@@ -312,7 +326,7 @@ If the user selects neither (just "Skip"), stop here.
 - **Strip `---` lines from the summary.** Google Docs API has no horizontal rule support; these render as literal text or cause issues.
 - **The summary content should otherwise be identical to the local markdown file** — same section headings, same body text, same appendices. The only differences are: removal of `---` dividers, and replacing the title/date/participants heading block with just `## YYYY-MM-DD`.
 
-**Step 7c: Send call notes email** (if selected)
+**Step 6c: Send call notes email** (if selected)
 
 **IMPORTANT:** Always use the `send-email` skill (Node.js script) for sending emails.
 
@@ -399,7 +413,7 @@ cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<messa
 
 Show the user a preview of the email and ask for confirmation before sending.
 
-**Step 7d: Send call notes via Slack DM** (if selected)
+**Step 6d: Send call notes via Slack DM** (if selected)
 
 1. **Find the person's Slack DM channel:**
    - Check `people.json` for a `slack_dm_channel` field on the person's entry
@@ -619,16 +633,16 @@ The registry at `~/.agents/data/people.json` stores per-person metadata: default
 **Fields:**
 - `full_name` — display name
 - `initials` — lowercase initials for meeting doc lookup (e.g., "mb", "jho")
-- `email` — email address for sending call notes (Step 7c), or `null`
-- `slack_dm_channel` — Slack DM details for sending call notes (Step 7d), or `null`. Object with `channel_id`, `workspace` (e.g. "type3ltd", "80000hours"), and `slack_connect` (boolean)
-- `default_project` — project folder name for auto-association (Step 5), or `null`
-- `meeting_doc` — Google Doc reference for call summaries (Step 7b), or `null`
+- `email` — email address for sending call notes (Step 6c), or `null`
+- `slack_dm_channel` — Slack DM details for sending call notes (Step 6d), or `null`. Object with `channel_id`, `workspace` (e.g. "type3ltd", "80000hours"), and `slack_connect` (boolean)
+- `default_project` — project folder name for auto-association (Step 4), or `null`
+- `meeting_doc` — Google Doc reference for call summaries (Step 6b), or `null`
 
 **Lookups:**
-- **By name** (Step 5a): convert name to hyphenated key, check `people`
-- **By initials** (Step 7b): scan `people` for matching `initials` field; if not found, search with `gdoc find "ph-{initials}" --title` and save the result
+- **By name** (Step 4a): convert name to hyphenated key, check `people`
+- **By initials** (Step 6b): scan `people` for matching `initials` field; if not found, search with `gdoc find "ph-{initials}" --title` and save the result
 
 **Adding entries:**
 - Automatically when a meeting doc is found via search
-- When the user accepts the offer to register a person with a project (Step 5e)
+- When the user accepts the offer to register a person with a project (Step 4e)
 - Manual edits

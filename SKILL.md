@@ -79,11 +79,11 @@ Provide a free-text input option since participant names can't be predicted.
 
 **Store the confirmed names** and use them consistently throughout the tidied transcript and summary.
 
-### Step 3: Create tidied transcript and summary (parallel)
+### Step 3: Create tidied transcript, summary, and pre-fetch (parallel)
 
-Launch **two Agent tool calls in a single message** to run the tidied transcript and summary concurrently. Both agents work from the **raw transcript**—the summary does not depend on the tidied transcript.
+This step launches **everything that can run concurrently** in a single message to minimise wall-clock time. All of the following should be dispatched together:
 
-**Agent 1: Tidied transcript** (`model: "sonnet"`)
+**Agent 1: Tidied transcript** (`model: "sonnet"`, `run_in_background: true`)
 
 Prompt the agent with the full raw transcript text, the confirmed participant names, and the instructions below. The agent must write the result to `data/tidied-transcripts/` using the same filename as the raw transcript.
 
@@ -131,20 +131,40 @@ Prompt the agent with the full raw transcript text, the confirmed participant na
 
 **Important:** Both agents must receive the full formatting guidelines in their prompt—they do not have access to this skill file.
 
-**Only the summary (Agent 2) blocks progression.** The tidied transcript is for reference only—launch Agent 1 with `run_in_background: true` and proceed to Step 4 as soon as the summary agent completes. The tidied transcript will finish on its own; if it's not done by Step 4d (copy files to project), wait for it then.
+**Pre-fetch: People registry + Google Doc anchor** (Bash, in parallel with agents)
+
+Before the agents finish, look up the other participant in the people registry and pre-fetch the Google Doc anchor text. Run these **in the same message as the agent launches:**
+
+1. Read the people registry: `cat ~/.agents/data/people.json`
+2. If the person is registered and has a `meeting_doc`, also start reading the Google Doc anchor:
+   ```bash
+   gdoc cat <doc_id> --tab "Call summaries" > /tmp/gdoc-tab-content.txt
+   ```
+
+Store the results (person registry data, project association, gdoc anchor text) for use in Steps 4 and 6.
+
+**Early question: Ask about sharing** (AskUserQuestion, in parallel with agents)
+
+For 1:1 calls where the other participant has a clear name, ask the Step 6a sharing question **now** rather than waiting until after the summary is complete. Use AskUserQuestion with `multiSelect: true`:
+
+- **"Add summary to meeting doc"** — always show for 1:1 calls
+- **"Send call notes email to [Person Name]"** — always show for 1:1 calls
+- **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
+- **"Skip"** — always show
+
+**Skip the early question for:** group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions.
+
+**Progression:** Only the summary (Agent 2) blocks progression to Step 4. The tidied transcript, pre-fetch, and sharing question all run concurrently. If the user answers the sharing question before the summary completes, hold that answer for Step 6.
 
 ### Step 4: Associate with project
 
-Immediately after creating the summary, determine if this call should be associated with a project.
+Immediately after creating the summary, determine if this call should be associated with a project. **Use the people registry data pre-fetched in Step 3** — do not re-read `people.json` here.
 
 **Step 4a: Check the people registry**
 
 1. Extract the other participant's name from the meeting title (the person who isn't the user)
 2. Convert to registry key format: lowercase, hyphenated (e.g., "Jane Smith" → "jane-smith")
-3. Read the registry file:
-   ```bash
-   cat ~/.agents/data/people.json
-   ```
+3. Use the registry data already fetched in Step 3 (if not pre-fetched, read it now: `cat ~/.agents/data/people.json`)
 4. Check if the key exists in `people` and has a `default_project` value
 
 **Step 4b: If person is registered → auto-associate**
@@ -237,9 +257,9 @@ open "/Users/username/Documents/Projects/acme-consulting/calls/summaries/2026-01
 - Meetings without a clear person name
 - Internal meetings or solo sessions
 
-**Step 6a: Ask what the user wants to do**
+**Step 6a: Check for early answer or ask now**
 
-Use AskUserQuestion with `multiSelect: true`:
+If the sharing question was already asked in Step 3 (and the user has answered), use that answer. If it wasn't asked yet (e.g., participant names were unclear at Step 3), ask now using AskUserQuestion with `multiSelect: true`:
 
 - **"Add summary to meeting doc"** — always show for 1:1 calls
 - **"Send call notes email to [Person Name]"** — always show for 1:1 calls
@@ -251,17 +271,18 @@ If the user selects neither (just "Skip"), stop here.
 **Step 6b: Add summary to Google Doc** (if selected)
 
 1. **Look up the meeting doc:**
-   - Extract the other participant's initials from their name (e.g., "Matt Brooks" → "mb")
-   - Look up the person in `~/.agents/data/people.json` by initials and check for a `meeting_doc` entry
-   - If not found, try `gdoc find "ph-{initials}" --title` to search Google Drive
+   - Use the person's entry from the people registry (pre-fetched in Step 3) and check for a `meeting_doc` entry
+   - If not found in registry, extract the other participant's initials (e.g., "Matt Brooks" → "mb") and try `gdoc find "ph-{initials}" --title` to search Google Drive
      (IMPORTANT: always use `--title` — without it, short queries trigger full-text content search which can hang)
    - If a doc is found via search, save it to the person's `meeting_doc` field in `people.json` (create the person entry if needed)
    - If no doc is found at all, tell the user and skip this action
 
 2. **Read the current "Call summaries" tab** to find the anchor text:
-   ```bash
-   gdoc cat <doc_id> --tab "Call summaries" > /tmp/gdoc-tab-content.txt
-   ```
+   - **If pre-fetched in Step 3**, use the already-downloaded `/tmp/gdoc-tab-content.txt`
+   - **If not pre-fetched**, read it now:
+     ```bash
+     gdoc cat <doc_id> --tab "Call summaries" > /tmp/gdoc-tab-content.txt
+     ```
    Read the output (ignoring any `gdoc` status lines at the top) and identify the **first line of real content**. This is the **anchor text** — typically a heading like `# Meeting summary: ...` or `# 2026-02-06`.
 
 3. **Create `/tmp/gdoc-old.txt`** — write ONLY the anchor text (a single line, no trailing newline):

@@ -85,13 +85,28 @@ def parse_iso_timestamp(ts: str) -> datetime:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def _effective_timestamp(doc: dict) -> str:
+    """Return the most recent activity timestamp for a doc.
+
+    Granola pre-creates documents for recurring calendar events, so ``created_at``
+    can point to when the series was first scheduled rather than when the call
+    actually happened. ``updated_at`` tracks the most recent edit (including
+    transcript ingestion), so it is a better proxy for "when did this meeting
+    really take place".
+    """
+    return doc.get('updated_at') or doc.get('created_at') or ''
+
+
 def get_recent_documents(limit: int = 5) -> list[dict]:
-    """Fetch recent documents from the Granola API."""
-    docs = api_call('get-documents', {'limit': limit})
+    """Fetch recent documents from the Granola API, sorted by most-recent activity."""
+    # Fetch a larger window than ``limit`` so the updated_at re-sort has room to
+    # surface docs that were created earlier but updated today.
+    docs = api_call('get-documents', {'limit': max(limit * 4, 30)})
     if not isinstance(docs, list):
         print(f"Error: Unexpected API response format", file=sys.stderr)
         sys.exit(1)
-    return docs
+    docs.sort(key=_effective_timestamp, reverse=True)
+    return docs[:limit]
 
 
 def check_recent():
@@ -107,12 +122,12 @@ def check_recent():
         print("No meetings found.")
         return
 
-    # Check if most recent meeting was created within threshold
+    # Check if most recent meeting was active within threshold
     most_recent = docs[0]
-    created_at = most_recent.get('created_at')
+    effective_ts = _effective_timestamp(most_recent)
 
-    if created_at:
-        meeting_time = parse_iso_timestamp(created_at)
+    if effective_ts:
+        meeting_time = parse_iso_timestamp(effective_ts)
         now = datetime.now(timezone.utc)
         minutes_ago = (now - meeting_time).total_seconds() / 60
 
@@ -133,7 +148,8 @@ def check_recent():
     }
 
     for i, doc in enumerate(docs, 1):
-        date_str = doc['created_at'][:10] if doc.get('created_at') else 'Unknown'
+        effective = _effective_timestamp(doc)
+        date_str = effective[:10] if effective else 'Unknown'
         result['meetings'].append({
             'number': i,
             'id': doc['id'],
@@ -150,7 +166,8 @@ def list_meetings():
 
     print(f"Found {len(docs)} recent meeting(s):\n")
     for i, doc in enumerate(docs, 1):
-        date_str = doc['created_at'][:10] if doc.get('created_at') else 'Unknown date'
+        effective = _effective_timestamp(doc)
+        date_str = effective[:10] if effective else 'Unknown date'
         print(f"{i}. [{date_str}] {doc.get('title', 'Untitled')}")
         print(f"   ID: {doc['id']}")
         print()
@@ -174,8 +191,8 @@ def build_transcript(doc_id: str) -> tuple[str, str, str]:
     doc = docs_list[0] if docs_list else {}
 
     title = doc.get('title', 'Untitled')
-    created_at = doc.get('created_at', '')
-    date_str = created_at[:10] if created_at else 'unknown-date'
+    effective = _effective_timestamp(doc)
+    date_str = effective[:10] if effective else 'unknown-date'
 
     # Fetch transcript chunks
     chunks = api_call('get-document-transcript', {'document_id': doc_id})

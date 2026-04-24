@@ -5,7 +5,7 @@ description: This skill should be used when the user asks to "summarise my call"
 
 # Granola transcript summarisation
 
-This skill extracts raw meeting transcripts from the Granola app, creates tidied transcripts and structured summaries, files them to the relevant project, and optionally adds summaries to a shared Google Doc, sends call notes via email, or sends them as a Slack DM.
+This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, files them to the relevant project, and optionally adds the summary + raw transcript to a shared Google Doc (summary → "Call summaries" tab, raw transcript → "Call transcripts" tab), sends call notes via email, or sends them as a Slack DM. A tidied transcript is opt-in and runs in the background after the main workflow.
 
 **Update check:** Before starting, run `bash ~/.claude/skills/summarise-granola/scripts/check-update.sh`. If it prints output, show the message and ask the user which action to take:
 - **Update now** — run `bash ~/.claude/skills/summarise-granola/scripts/update-skill.sh`, then re-read this SKILL.md before continuing
@@ -57,6 +57,16 @@ python3 ~/.claude/skills/summarise-granola/scripts/granola.py recent <n>
 
 The transcript is automatically saved to `data/transcripts/`.
 
+### Step 2.3: Apply STT corrections
+
+Run the context-aware STT corrections script on the saved transcript:
+
+```bash
+python3 ~/.agents/scripts/utils/apply-stt-corrections.py <transcript-path>
+```
+
+This applies corrections from `~/.agents/references/stt-corrections.json` — fixing known STT errors for org names, person names, and acronyms. Scoped corrections (entries with a `context` field) only apply when at least one context keyword appears in the transcript. Changes are printed to stderr; if any were made, note them briefly in the Step 6 report.
+
 ### Step 2.5: Confirm participant names
 
 Before creating the tidied transcript and summary, confirm the names of all participants.
@@ -79,102 +89,155 @@ Provide a free-text input option since participant names can't be predicted.
 
 **Store the confirmed names** and use them consistently throughout the tidied transcript and summary.
 
-### Step 3: Create tidied transcript, summary, and pre-fetch (parallel)
+### Step 2.6: Ask about sharing (before parallel work)
 
-This step launches **everything that can run concurrently** in a single message to minimise wall-clock time. All of the following should be dispatched together:
+For 1:1 calls where the other participant has a clear name, ask the sharing questions **now**—before launching any background agents. This must happen in its own message so the user sees it immediately.
 
-**Agent 1: Tidied transcript** (`model: "sonnet"`, `run_in_background: true`)
+**Skip this step for:** group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions.
 
-Prompt the agent with the full raw transcript text, the confirmed participant names, and the instructions below. The agent must write the result to `data/tidied-transcripts/` using the same filename as the raw transcript.
+**Step 2.6a: Ask sharing options**
 
-<details>
-<summary>Tidying instructions (include in agent prompt)</summary>
+Use AskUserQuestion with `multiSelect: true`:
 
-**Tidying guidelines:**
-
-- Remove filler words (um, uh, you know) and false starts
-- Fix obvious transcription errors and grammar
-- Keep speaker labels clear and consistent
-- Add section headings for major topic shifts
-- Do not invent or infer facts not present in the transcript
-
-**Preserve exact wording (in quotation marks) for:**
-
-- Expressions of certainty/uncertainty:
-  - Confidence levels ("very confident", "somewhat unsure", "fairly certain")
-  - Probabilistic language ("probably", "definitely", "might", "possibly")
-  - Percentage estimates ("70% sure", "almost certain", "50/50")
-  - Hedging language ("I think", "it seems like", "my sense is")
-- Commitments and decisions ("I will", "we've decided", "I promise")
-- Memorable or distinctive phrasing
-- Technical specifications, numbers, or data points
-- Emotional or emphatic statements
-
-**For everything else:**
-
-- Lightly paraphrase for clarity and concision
-- Combine fragmented thoughts into coherent points
-- Group related back-and-forth exchanges
-
-**Tidied transcript format:**
-
-- Use "**Speaker Name**:" format for attribution (bold name). If there are only two participants, use first names only.
-- Separate each conversation turn with a new paragraph (not just a line break)
-- Put direct quotes in "quotation marks"
-- Use bullet points for lists or multiple related points
-
-</details>
-
-**Agent 2: Summary** (`model: "opus"`)
-
-Prompt the agent with the full raw transcript text, the confirmed participant names, and the complete summary format guidelines from the "Summary format" section of this skill file. The agent must write the result to `data/summaries/` using the same filename as the transcript.
-
-**Important:** Both agents must receive the full formatting guidelines in their prompt—they do not have access to this skill file.
-
-**Pre-fetch: People registry + Google Doc anchor** (Bash, in parallel with agents)
-
-Before the agents finish, look up the other participant in the people registry and pre-fetch the Google Doc anchor text. Run these **in the same message as the agent launches:**
-
-1. Read the people registry: `cat ~/.agents/data/people.json`
-2. If the person is registered and has a `meeting_doc`, also start reading the Google Doc anchor:
-   ```bash
-   gdoc cat <doc_id> --tab "Call summaries" > /tmp/gdoc-tab-content.txt
-   ```
-
-Store the results (person registry data, project association, gdoc anchor text) for use in Steps 4 and 6.
-
-**Early question: Ask about sharing** (AskUserQuestion, in parallel with agents)
-
-For 1:1 calls where the other participant has a clear name, ask the Step 6a sharing question **now** rather than waiting until after the summary is complete. Use AskUserQuestion with `multiSelect: true`:
-
-- **"Add summary to meeting doc"** — always show for 1:1 calls
+- **"Add summary + raw transcript to meeting doc"** — always show for 1:1 calls. Inserts the summary into the "Call summaries" tab AND the raw transcript (with speaker labels substituted for the confirmed participant names) into the "Call transcripts" tab.
 - **"Send call notes email to [Person Name]"** — always show for 1:1 calls
 - **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
-- **"Skip"** — always show
+- **"Create tidied transcript"** — always show (off by default). Fire-and-forget background agent that runs AFTER the main workflow finishes (Step 8). Does not block the gdoc insert or the Slack/email send.
+- **"Skip"** — always show, and is the default if the user just hits enter
 
-**Skip the early question for:** group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions.
+**Important:** This question MUST be sent alone (not bundled with Agent or Bash tool calls in the same message). If it's sent in parallel with background agents, the user won't see it until all parallel calls complete, defeating the purpose.
 
-**Progression:** Only the summary (Agent 2) blocks progression to Step 4. The tidied transcript, pre-fetch, and sharing question all run concurrently. If the user answers the sharing question before the summary completes, hold that answer for Step 6.
+**Step 2.6b: If email or Slack was selected, ask about comment and auto-send**
 
-### Step 4: Associate with project
+If the user selected "Send call notes email" or "Send call notes Slack DM" in 2.6a, immediately ask two follow-up questions in a single AskUserQuestion call (before launching agents). This bundles all user-facing prompts up front so the rest of the workflow can run unattended.
 
-Immediately after creating the summary, determine if this call should be associated with a project. **Use the people registry data pre-fetched in Step 3** — do not re-read `people.json` here.
+Question 1 — **Comment** (single-select):
+- **"No comment"**
+- **"Add a comment"** — the user will type the comment via the free-text option
 
-**Step 4a: Check the people registry**
+Question 2 — **Approval** (single-select):
+- **"Auto-send when ready"** — skip the final preview/confirmation and send as soon as the summary and gdoc edit are done
+- **"Show preview first"** — show a preview and wait for explicit confirmation before sending
+
+**If the user picks "Auto-send when ready", do NOT ask for confirmation again in Steps 7b or 7c — just send.** The user has pre-authorised the send.
+
+Hold all answers (sharing selections, comment, auto-send preference) for use in Steps 4 and 7.
+
+### Step 3: Launch summary agent and pre-fetch (parallel)
+
+Launch the summary agent alongside pre-fetch work in a single message to minimise wall-clock time to a sent Slack/email.
+
+**Do NOT launch the tidied transcript agent here.** The tidied transcript agent runs at the very end (Step 8) as a fire-and-forget background task, AFTER the gdoc insert and Slack/email have been sent. This keeps it off the critical path entirely.
+
+**Summary agent** (`model: "opus"`)
+
+Before launching, `Read` `references/summary-format.md` — paste its full contents verbatim into the agent prompt. The agent has no access to skill files, so the guidelines must travel with the prompt.
+
+Prompt the agent with: the full raw transcript text, the confirmed participant names, the summary-format contents, and an instruction to write the result to `data/summaries/` using the same filename as the transcript (with `--summary.md` suffix).
+
+**Pre-fetch: People registry + Google Doc tab contents** (Bash, in parallel with the agent)
+
+Before the agent finishes, look up the other participant in the people registry and pre-fetch the current contents of both gdoc tabs. Run these **in the same message as the agent launch:**
+
+1. Read the people registry: `cat ~/.agents/data/people.json`
+2. If the person is registered and has a `meeting_doc`, also start reading both tabs (each tab goes to its own file so anchor detection in Step 4c stays straightforward):
+   ```bash
+   gdoc cat <doc_id> --tab "Call summaries"   > /tmp/gdoc-summary-tab.txt
+   gdoc cat <doc_id> --tab "Call transcripts" > /tmp/gdoc-transcript-tab.txt
+   ```
+   If either tab doesn't exist the call fails — that's fine, just proceed; Step 4c treats missing output as "tab empty or absent".
+
+Store the results (person registry data, project association, tab contents) for use in Steps 4, 5, and 7.
+
+**Progression:** The summary agent blocks progression to Step 4. The pre-fetch runs concurrently with it.
+
+### Step 4: Add summary and raw transcript to meeting doc (if selected)
+
+**Skip this step** if the user did not select "Add summary + raw transcript to meeting doc" in Step 2.6, or if this is a group meeting / meeting without a clear person name.
+
+**Why this happens before project association:** the meeting doc is the most visible deliverable and the most useful thing to share with the other participant. Getting it written to Google Docs first means that even if the project-association question in Step 5 is mis-answered or skipped, the canonical content is already landed in the right place.
+
+**Two inserts:** the summary goes into the "Call summaries" tab, and the raw transcript (with Me/Other substituted for the confirmed participant names) goes into the "Call transcripts" tab. Both happen in this step.
+
+**Step 4a: Look up the meeting doc**
+
+```bash
+python3 ~/.claude/skills/summarise-granola/scripts/find_meeting_doc.py --name "<Full Name>"
+```
+
+Returns JSON on stdout: `{"doc_id": "...", "source": "registry|search|not_found", "person_key": "..."}`. The script checks the registry first, falls back to `gdoc find "ph-<initials>" --title`, and caches any search hit back into `people.json` automatically.
+
+If the person is not in the registry, also pass `--initials <xx>` (e.g., `--initials mb` for "Matt Brooks"). If `source: not_found`, tell the user and skip this step.
+
+**Step 4b: Prepare the gdoc insert files**
+
+```bash
+python3 ~/.claude/skills/summarise-granola/scripts/prepare_gdoc_inserts.py \
+  --summary <summary-path> --transcript <raw-transcript-path> \
+  --user-first <user-first-name> --other-first <other-first-name> \
+  --date YYYY-MM-DD
+```
+
+Writes `/tmp/gdoc-summary.txt` and `/tmp/gdoc-raw-transcript.txt`. The script strips `---` lines, collapses blank lines around `##` headings, rewrites the summary heading block to `# YYYY-MM-DD`, substitutes `**Me**:`/`**Other**:` in the raw transcript, and validates post-conditions (first line is `# YYYY-MM-DD`, no residual `---` or `**Me**:`/`**Other**:`). Non-zero exit + stderr on any mismatch — if that happens, stop and surface the error.
+
+**Step 4c: Push each file to its tab**
+
+**Default to `gdoc edit` when the tab already has content** — it preserves formatting better than `gdoc insert` on populated tabs (where `insert` has been observed to cause formatting problems). Use `gdoc insert --position start` **only when the tab is empty** (or doesn't exist yet — in which case `insert` auto-creates it cleanly).
+
+Decide per tab based on the pre-fetched content from Step 3 (`/tmp/gdoc-summary-tab.txt` and `/tmp/gdoc-transcript-tab.txt`):
+
+1. **Detect the anchor.** Find the first non-blank, non-status line of real content in the tab file. `gdoc cat` prepends lines like `account: default (use --account to switch)` and `--- first interaction with this doc ---` — skip those, plus the ` 📄 "<title>" by <user>, last edited <date>` status line. The **first real content line** (typically `# YYYY-MM-DD` or `# Meeting summary: ...`) is the anchor. If there's no real content line, treat the tab as empty.
+
+2. **If the tab is populated (anchor found) → use `gdoc edit`:**
+   ```bash
+   # Append the anchor as the final line of the new file so the old anchor is preserved below the new content.
+   printf '\n%s' "$ANCHOR" >> /tmp/gdoc-summary.txt
+   printf -- '%s' "$ANCHOR" > /tmp/gdoc-summary-old.txt   # no trailing newline
+
+   gdoc edit <doc_id> --tab "Call summaries" \
+     --old-file /tmp/gdoc-summary-old.txt \
+     --new-file /tmp/gdoc-summary.txt
+   ```
+   The anchor must match exactly one place in the tab — the first line of existing content is always unique enough.
+
+3. **If the tab is empty or absent → use `gdoc insert`:**
+   ```bash
+   gdoc insert <doc_id> --tab "Call summaries" --position start /tmp/gdoc-summary.txt
+   ```
+
+Apply the same logic to the "Call transcripts" tab using `/tmp/gdoc-transcript-tab.txt` and `/tmp/gdoc-raw-transcript.txt`.
+
+Run the two tabs' pushes as separate Bash calls in the same message (independent, can parallelise). If the "Call transcripts" tab's `gdoc edit`/`gdoc insert` fails entirely (e.g. tab doesn't exist and insert couldn't create it), note it in the final report and continue; the summary push is what matters.
+
+**Step 4d: Record the "Call summaries" tab URL**
+
+```bash
+gdoc tabs <doc_id> --json | python3 -c "import json,sys; print(next(t['id'] for t in json.load(sys.stdin)['tabs'] if t['title']=='Call summaries'))"
+```
+
+Construct `https://docs.google.com/document/d/<doc_id>/edit?tab=<tab_id>` and cache it for Step 6 (reporting) and Step 7 (email/Slack).
+
+**Critical `gdoc` invariant:** Never use `gdoc pull` / `gdoc push` / `gdoc write` on multi-tab docs — they flatten tabs and destroy structure. Only `gdoc insert --tab` and `gdoc edit --tab` are safe.
+
+### Step 5: Associate with project
+
+Now that the meeting doc is updated, determine if this call should also be filed under a project folder. **Use the people registry data pre-fetched in Step 3** — do not re-read `people.json` here.
+
+**Step 5a: Check the people registry**
 
 1. Extract the other participant's name from the meeting title (the person who isn't the user)
 2. Convert to registry key format: lowercase, hyphenated (e.g., "Jane Smith" → "jane-smith")
 3. Use the registry data already fetched in Step 3 (if not pre-fetched, read it now: `cat ~/.agents/data/people.json`)
 4. Check if the key exists in `people` and has a `default_project` value
 
-**Step 4b: If person is registered → auto-associate**
+**Step 5b: If person is registered → auto-associate**
 
 If found in the registry:
 1. Get the `default_project` value
 2. Silently associate with that project (no confirmation needed)
-3. Note the auto-association for the final output (Step 5)
+3. Note the auto-association for the final output (Step 6)
 
-**Step 4c: If person is NOT registered → show project list**
+**Step 5c: If person is NOT registered → show project list**
 
 If not found in the registry, fall back to the full project selection:
 
@@ -186,51 +249,49 @@ Filter to only `status: "active"` projects and present options using AskUserQues
 - List each active project as an option (e.g., "80000 Hours advisory")
 - Include a "None" option for calls not associated with any project
 
-**Step 4d: Copy files to project**
+**Step 5d: Copy files to project**
 
 For both auto-associated and manually selected projects:
 
 1. Get the project's `folder` value (from registry's `default_project` or selected project's JSON)
 2. The project directory is: `~/Documents/Projects/{folder}/`
-3. Create the subdirectories if they don't exist: `{project_dir}/calls/summaries/` and `{project_dir}/calls/transcripts/`
-4. Copy files to the project:
-   - Summary: `{project_dir}/calls/summaries/{slug}--summary.md`
-   - Tidied transcript: `{project_dir}/calls/transcripts/{slug}--transcript.md`
+3. Create the subdirectory if it doesn't exist: `{project_dir}/calls/summaries/`
+4. Copy the summary: `{project_dir}/calls/summaries/{slug}--summary.md`
 
 Example:
 ```bash
 mkdir -p ~/Documents/Projects/2026-01-80000-hours-advisory/calls/summaries
-mkdir -p ~/Documents/Projects/2026-01-80000-hours-advisory/calls/transcripts
 cp ~/.claude/skills/summarise-granola/data/summaries/2026-01-06-meeting--summary.md ~/Documents/Projects/2026-01-80000-hours-advisory/calls/summaries/
-cp ~/.claude/skills/summarise-granola/data/tidied-transcripts/2026-01-06-meeting--transcript.md ~/Documents/Projects/2026-01-80000-hours-advisory/calls/transcripts/
 ```
 
-**Step 4e: Offer to register unregistered people**
+**Store `{project_dir}` in memory for Step 8** (the tidied transcript agent will handle its own copy into `{project_dir}/calls/transcripts/` when it finishes, to avoid blocking the main workflow).
+
+**Step 5e: Offer to register unregistered people**
 
 If the user selected a project for someone NOT in the registry, offer to add them:
 
 > "Would you like me to register [Name] with [Project] for future calls?"
 
-If yes, update `people.json` to add or update the entry with the `default_project` value.
+If yes, update `people.json` to add or update the entry with the `default_project` value. If Step 4 cached a `meeting_doc` for this person but the rest of the entry wasn't created yet, include that too.
 
 **If user selects "None":** No additional action needed, and don't offer registration.
 
-### Step 5: Report saved files and open them
+### Step 6: Report saved files and open them
 
 When reporting the files saved, always use **full expanded paths** (not relative paths or paths with `~`). This allows the user to control-click/command-click on the path in their terminal to open the file.
 
-**Indicate auto-association when applicable:**
-
-If the project was auto-associated via the person-project registry, include this in the output:
-```
-Auto-associated with **Acme Consulting** (Jane Smith is registered to this project)
-```
+**Include, in this order:**
+1. **Meeting doc link** (if Step 4 ran) — the "Call summaries" tab URL from Step 4d. If the raw transcript insert also succeeded, mention that inline ("Raw transcript added to 'Call transcripts' tab.").
+2. **Files saved** — full absolute path of the summary in the project folder.
+3. **Auto-association note** (when applicable) — e.g. `Auto-associated with **Acme Consulting** (Jane Smith is registered to this project)`
+4. **Tidied transcript note** (only if selected) — e.g. `Tidied transcript is generating in the background and will be saved to [paths] when done.`
 
 **Good:**
 ```
+Summary inserted at top of the "Call summaries" tab: https://docs.google.com/document/d/.../edit?tab=t.xxxx
+
 Files saved:
-- /Users/username/Documents/Projects/acme-consulting/context/calls/2026-01-09-meeting--summary.md
-- /Users/username/Documents/Projects/acme-consulting/context/calls/2026-01-09-meeting--transcript.md
+- /Users/username/Documents/Projects/acme-consulting/context/calls/summaries/2026-01-09-meeting--summary.md
 
 Auto-associated with **Acme Consulting** (Jane Smith is registered to this project)
 ```
@@ -247,136 +308,30 @@ Files saved:
 After copying files to a project, open the summary file:
 
 ```bash
-open "/Users/username/Documents/Projects/acme-consulting/calls/summaries/2026-01-09-meeting--summary.md"
+open "/Users/username/Documents/Projects/acme-consulting/context/calls/summaries/2026-01-09-meeting--summary.md"
 ```
 
-### Step 6: Offer to add summary to meeting doc and/or send call notes
+### Step 7: Send call notes (email or Slack DM)
 
-**Skip this step for:**
-- Group meetings (more than 2 participants)
-- Meetings without a clear person name
-- Internal meetings or solo sessions
+**Skip this step** if the user didn't select email or Slack DM in Step 2.6 (or if this is a group meeting / meeting without a clear person name).
 
-**Step 6a: Check for early answer or ask now**
+**Step 7a: Check for early answer or ask now**
 
-If the sharing question was already asked in Step 3 (and the user has answered), use that answer. If it wasn't asked yet (e.g., participant names were unclear at Step 3), ask now using AskUserQuestion with `multiSelect: true`:
+If the sharing question was already asked in Step 2.6 (and the user has answered), use that answer. If it wasn't asked yet (e.g., participant names were unclear at Step 2.5), ask now using AskUserQuestion with `multiSelect: true`:
 
-- **"Add summary to meeting doc"** — always show for 1:1 calls
 - **"Send call notes email to [Person Name]"** — always show for 1:1 calls
 - **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
 - **"Skip"** — always show
 
-If the user selects neither (just "Skip"), stop here.
+If the user selects only "Skip", stop here.
 
-**Step 6b: Add summary to Google Doc** (if selected)
+**The "Call summaries" tab URL was already resolved in Step 4d.** Reuse it here — do not re-look it up.
 
-1. **Look up the meeting doc:**
-   - Use the person's entry from the people registry (pre-fetched in Step 3) and check for a `meeting_doc` entry
-   - If not found in registry, extract the other participant's initials (e.g., "Matt Brooks" → "mb") and try `gdoc find "ph-{initials}" --title` to search Google Drive
-     (IMPORTANT: always use `--title` — without it, short queries trigger full-text content search which can hang)
-   - If a doc is found via search, save it to the person's `meeting_doc` field in `people.json` (create the person entry if needed)
-   - If no doc is found at all, tell the user and skip this action
-
-2. **Read the current "Call summaries" tab** to find the anchor text:
-   - **If pre-fetched in Step 3**, use the already-downloaded `/tmp/gdoc-tab-content.txt`
-   - **If not pre-fetched**, read it now:
-     ```bash
-     gdoc cat <doc_id> --tab "Call summaries" > /tmp/gdoc-tab-content.txt
-     ```
-   Read the output (ignoring any `gdoc` status lines at the top) and identify the **first line of real content**. This is the **anchor text** — typically a heading like `# Meeting summary: ...` or `# 2026-02-06`.
-
-3. **Create `/tmp/gdoc-old.txt`** — write ONLY the anchor text (a single line, no trailing newline):
-   ```bash
-   echo -n "Meeting summary: Matt Brooks & Peter Hartree" > /tmp/gdoc-old.txt
-   ```
-   The anchor must exactly match text in the tab. Do NOT include the full tab content.
-
-4. **Create `/tmp/gdoc-new.txt`** — use `cat <<'EOF'` via Bash (not the Write tool) to avoid the read-before-write check on temp files:
-   - Read the local summary markdown file (the one saved in Step 3)
-   - Strip all `---` horizontal rule lines and collapse surrounding blank lines so there is only one blank line before each heading (Google Docs API cannot render horizontal rules; double blank lines produce unwanted spacing)
-   - **Replace the heading block** with just the date as H1. The local markdown file has:
-     ```
-     # Meeting summary: [title]
-
-     **Date:** YYYY-MM-DD
-
-     **Participants:** [names]
-     ```
-     Replace all of that with just:
-     ```
-     # YYYY-MM-DD
-     ```
-     Everything else (Summary, Parts, Appendices) stays the same.
-   - **No blank lines between headings and body text.** Every `##` heading should be immediately followed by the body text on the next line (no blank line in between). Blank lines should only appear *before* headings (to separate sections).
-   - **Keep all other markdown formatting intact**: `##` headings, `**bold**`, `- bullet` lists, `1.` numbered lists, `| table |` rows. `gdoc edit` parses the new-file as markdown and converts it to Google Docs formatting (heading styles, bold, bullets, tables with bold headers). If the markdown syntax is missing, the content will appear as unformatted plain text.
-   - Append the anchor text as the final line (so the new summary appears above existing content)
-
-   **No blank line between `# YYYY-MM-DD` and the first `## Summary` heading.** The date heading and first section heading should be immediately adjacent.
-
-   Example:
-   ```bash
-   cat <<'EOF' > /tmp/gdoc-new.txt
-   # 2026-02-24
-   ## Summary
-   Peter and JP discussed...
-
-   ## Part 1: [topic]
-   [body text...]
-
-   ## Appendix 2: Key quotes
-   | Speaker | Quote | Context |
-   |---------|-------|---------|
-   | JP | "quote" | context |
-
-   # 2026-02-19
-   EOF
-   ```
-
-5. **Push the edit:**
-   ```bash
-   gdoc edit <doc_id> --tab "Call summaries" --old-file /tmp/gdoc-old.txt --new-file /tmp/gdoc-new.txt
-   ```
-
-6. Report success or failure to the user.
-
-**Critical `gdoc` rules (these prevent data loss and formatting bugs):**
-
-- **Never use `gdoc pull`/`gdoc push`/`gdoc write` on multi-tab docs.** They flatten all tabs into a single document, destroying the tab structure. Always use `gdoc edit --tab`.
-- **The old-file must match a unique string in the tab.** Use the first line of existing content as the anchor — not the full tab content.
-- **The new-file MUST contain proper markdown syntax.** `gdoc edit` parses the new-file as markdown and applies formatting via the Google Docs API. If you write plain text without `#`, `**`, etc., the content will appear unformatted in the doc.
-- **Strip `---` lines from the summary.** Google Docs API has no horizontal rule support; these render as literal text or cause issues.
-- **The summary content should otherwise be identical to the local markdown file** — same section headings, same body text, same appendices. The only differences are: removal of `---` dividers, and replacing the title/date/participants heading block with just `## YYYY-MM-DD`.
-
-**Step 6c: Send call notes email** (if selected)
+**Step 7b: Send call notes email** (if selected)
 
 **IMPORTANT:** Always use the `send-email` skill (Node.js script) for sending emails.
 
-**If the user wants to send the email:**
-
-**a) Find the meeting doc and get the Call summaries tab URL:**
-
-Meeting docs follow the naming pattern `ph-${initials}` (e.g., `ph-js` for Jane Smith).
-
-1. Extract person initials: first letter of each word in their name, lowercase (e.g., "Jane Smith" → "js")
-2. Check `people.json` first: look up the person by initials and check for a `meeting_doc` entry. If found, use the cached URL.
-3. If not cached, search Google Drive:
-   ```bash
-   gdoc find "ph-${initials}" --title
-   ```
-4. Cache any new result in `people.json` under the person's `meeting_doc` field.
-
-5. **Get the "Call summaries" tab URL:**
-   Extract the doc ID from the meeting doc URL, then get tab info:
-   ```bash
-   gdoc tabs <doc_id> --json
-   ```
-   Find the tab with `"title": "Call summaries"` and extract its `id` field. Construct the tab URL:
-   ```
-   https://docs.google.com/document/d/<doc_id>/edit?tab=<tab_id>
-   ```
-   **Always link to the "Call summaries" tab**, not the base doc URL.
-
-**b) Find the attendee's email address:**
+**a) Find the attendee's email address:**
 
 1. Check `people.json` for an `email` field on the person's entry. If found, use it.
 2. If not found, search Gmail using the **claude.ai Gmail MCP**:
@@ -393,13 +348,15 @@ Meeting docs follow the naming pattern `ph-${initials}` (e.g., `ph-js` for Jane 
 3. If Gmail search doesn't find a match, ask the user for the email address.
 4. Once an email is obtained (from Gmail or the user), save it to the person's `email` field in `people.json` for future use.
 
-**c) Ask if the user wants to add a comment:**
+**b) Comment:**
+
+Use the comment answer collected in Step 2.6b. Do NOT ask again. If Step 2.6b was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion:
 
 > "Would you like to add a comment to the call notes email?"
 
 - Provide a "No comment" option and a free-text "Add a comment" option
 
-**d) Send the email using the send-email skill:**
+**c) Send the email using the send-email skill:**
 
 Use the send-email skill's Node.js script directly:
 
@@ -432,9 +389,11 @@ cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<messa
   Peter
   ```
 
-Show the user a preview of the email and ask for confirmation before sending.
+**Approval behaviour:**
+- If the user selected **"Auto-send when ready"** in Step 2.6b, skip the preview/confirmation and send immediately.
+- Otherwise, show the user a preview of the email and ask for confirmation before sending.
 
-**Step 6d: Send call notes via Slack DM** (if selected)
+**Step 7c: Send call notes via Slack DM** (if selected)
 
 1. **Find the person's Slack DM channel:**
    - Check `people.json` for a `slack_dm_channel` field on the person's entry
@@ -446,7 +405,9 @@ Show the user a preview of the email and ask for confirmation before sending.
      - Once the correct user is identified, find their DM channel via `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> channels "im"` and match by user ID
    - Cache the full object in `people.json` under the person's `slack_dm_channel` field for future use
 
-2. **Compose message** using Slack mrkdwn formatting — keep it brief (no greeting or sign-off):
+2. **Comment:** use the comment answer collected in Step 2.6b. Do NOT ask again. If Step 2.6b was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion: "Would you like to add a comment to the Slack DM?" with a "No comment" option and a free-text "Add a comment" option.
+
+3. **Compose message** using Slack mrkdwn formatting — keep it brief (no greeting or sign-off):
    - **Without comment:**
      ```
      Summary of our call here:
@@ -460,14 +421,33 @@ Show the user a preview of the email and ask for confirmation before sending.
      <user's comment>
      ```
 
-3. **Show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith** on type3ltd?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
+4. **Approval behaviour:**
+   - If the user selected **"Auto-send when ready"** in Step 2.6b, skip the preview/confirmation and send immediately.
+   - Otherwise, **show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith** on type3ltd?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
 
-4. **Send via Slack** (always pass `--workspace` from the cached entry):
+5. **Send via Slack** (always pass `--workspace` from the cached entry):
    ```bash
    python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <workspace> send "<channel_id>" "<message>"
    ```
 
-5. Report success or failure to the user.
+6. Report success or failure to the user.
+
+### Step 8: Launch tidied transcript agent (background, fire-and-forget)
+
+**Skip this step** if the user did not select "Create tidied transcript" in Step 2.6.
+
+Launch with `Agent(model: "sonnet", run_in_background: true)`. This is the last thing you do — the gdoc insert and Slack/email are already sent. When the agent finishes later, its completion notification can be acknowledged with a one-liner (e.g. "Tidied transcript saved to X.").
+
+**Agent prompt (must be self-contained — the agent has no access to this skill file):**
+
+Before launching, `Read` `references/tidying-instructions.md` and paste its contents verbatim into the prompt.
+
+Include:
+1. The **full raw transcript text** (paste inline from `data/transcripts/{slug}.md`).
+2. The **confirmed participant names** from Step 2.5.
+3. Instruction to write the tidied transcript to: `/Users/ph/.claude/skills/summarise-granola/data/tidied-transcripts/{slug}--transcript.md`
+4. If a project folder was determined in Step 5, also instruct the agent to copy the final file to: `/Users/ph/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md` (after creating the parent directory with `mkdir -p`).
+5. The tidying guidelines from `references/tidying-instructions.md` (pasted verbatim).
 
 ## File locations
 
@@ -479,129 +459,6 @@ Files use the pattern:
 - Raw transcripts: `YYYY-MM-DD-meeting-title-slug.md`
 - Tidied transcripts: `YYYY-MM-DD-meeting-title-slug--transcript.md`
 - Summaries: `YYYY-MM-DD-meeting-title-slug--summary.md`
-
-## Summary format
-
-Create comprehensive, chronological summaries that help the user re-envision and remember the conversation. The chronological structure is key—it allows details not explicitly in the summary to be recalled by following the flow.
-
-### Document structure
-
-```markdown
-# Meeting summary: [Title]
-
-**Date:** YYYY-MM-DD
-
-**Participants:** [Full names with roles if relevant]
-
----
-
-## Summary
-
-[3-5 sentence overview of what the call was about and what was concluded. If listing items, use a numbered list with each item on its own line.]
-
----
-
-## Part 1: [Opening topic/context]
-
-[Chronological narrative of this phase of the conversation...]
-
----
-
-## Part 2: [Next major topic]
-
-[Continue chronologically...]
-
----
-
-## Part N: The path forward / Next steps
-
-[Clear statement of decisions and actions decided upon]
-
-**Specific actions agreed:**
-1. First action
-2. Second action
-3. ...
-
-**[Person]'s next step:**
-[Immediate action to take]
-
----
-
-## Appendix 1: Open questions
-
-- Question 1
-- Question 2
-
----
-
-## Appendix 2: Key quotes
-
-| Speaker | Quote | Context |
-|---------|-------|---------|
-| Name | "Quote text" | Brief context |
-
----
-
-## Appendix 3: Underlying dynamics
-
-[Optional—include when there are important subtext, emotional dynamics, or strategic considerations worth noting. Skip if not applicable.]
-
-**[Dynamic 1]:** Explanation...
-
-**[Dynamic 2]:** Explanation...
-```
-
-### Formatting guidelines
-
-**Lists:**
-- Use **numbered lists** when items might be referred to later (options, action items, decisions)
-- Use **lettered lists (a, b, c)** when you don't want to imply prioritisation
-- Use **bullet lists** only for items that won't need to be referenced
-- Always put each list item on its own line (no inline numbered lists)
-
-**Quotations:**
-- Use inline "quotation marks" for short, key phrases within prose
-- Use block quotes (>) for longer or particularly important statements
-- Preserve exact wording for:
-  - Expressions of certainty/uncertainty
-  - Commitments and decisions
-  - Memorable or distinctive phrasing
-  - Insights and realisations
-
-**Structure:**
-- Use `---` horizontal rules to separate major sections
-- Bold speaker names when attributing quotes or positions
-- Use tables for structured comparisons (e.g., concept assessments)
-
-### Content guidelines
-
-**Depth:** Match depth to the richness of the conversation. A substantive 45-minute strategy discussion warrants 150-200+ lines; a brief check-in might need only 50.
-
-**Chronological narrative:** Tell the story of how the conversation unfolded and how conclusions were reached. This helps the user mentally reconstruct the call.
-
-**Capture insights:** Don't just list decisions—capture the reasoning, realisations, and shifts in thinking that led to them.
-
-**Appendices:**
-- **Open questions** (Appendix 1): Almost always include; usually first appendix
-- **Key quotes** (Appendix 2): Include when there are memorable or important phrasings
-- **Underlying dynamics** (Appendix 3): Include when there's important subtext (emotional state, strategic considerations, relationship dynamics); skip when not applicable
-
-### Example part structure
-
-```markdown
-## Part 2: Diagnosing the problem
-
-Alex asked a pivotal question: "Is this a brief issue or an execution of the brief issue?"
-
-This opened up a crucial realisation. Alex introduced the "new aesthetics" framing—an emerging visual language for the project.
-
-The user's reaction was immediate recognition:
-> "We should be at the front of that. In my dream world, if I was leading this, I would have put a lot into trying to be at the front of that."
-
-**The diagnosis crystallised:** The brief hadn't communicated this ambition. The user admitted: "It definitely wasn't pitched that ambitiously."
-
-This explained the expectation gap: The user was unconsciously hoping for something revolutionary while the agency was delivering competent-but-safe work as briefed.
-```
 
 ## Transcript format
 
@@ -649,21 +506,21 @@ The registry at `~/.agents/data/people.json` stores per-person metadata: default
 }
 ```
 
-**Key format:** Lowercase, hyphenated full name (e.g., "Rob Long" → "rob-long")
+**Key format:** Lowercase, hyphenated full name (e.g., "Jane Smith" → "jane-smith")
 
 **Fields:**
 - `full_name` — display name
-- `initials` — lowercase initials for meeting doc lookup (e.g., "mb", "jho")
-- `email` — email address for sending call notes (Step 6c), or `null`
-- `slack_dm_channel` — Slack DM details for sending call notes (Step 6d), or `null`. Object with `channel_id`, `workspace` (e.g. "type3ltd", "80000hours"), and `slack_connect` (boolean)
-- `default_project` — project folder name for auto-association (Step 4), or `null`
-- `meeting_doc` — Google Doc reference for call summaries (Step 6b), or `null`
+- `initials` — lowercase initials for meeting doc lookup (e.g., "js", "ab")
+- `email` — email address for sending call notes (Step 7b), or `null`
+- `slack_dm_channel` — Slack DM details for sending call notes (Step 7c), or `null`. Object with `channel_id`, `workspace` (e.g. "type3ltd", "80000hours"), and `slack_connect` (boolean)
+- `default_project` — project folder name for auto-association (Step 5), or `null`
+- `meeting_doc` — Google Doc reference for call summaries (Step 4), or `null`
 
 **Lookups:**
-- **By name** (Step 4a): convert name to hyphenated key, check `people`
-- **By initials** (Step 6b): scan `people` for matching `initials` field; if not found, search with `gdoc find "ph-{initials}" --title` and save the result
+- **By name** (Step 5a): convert name to hyphenated key, check `people`
+- **By initials** (Step 4a): scan `people` for matching `initials` field; if not found, search with `gdoc find "ph-{initials}" --title` and save the result
 
 **Adding entries:**
 - Automatically when a meeting doc is found via search
-- When the user accepts the offer to register a person with a project (Step 4e)
+- When the user accepts the offer to register a person with a project (Step 5e)
 - Manual edits

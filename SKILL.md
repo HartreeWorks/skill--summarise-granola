@@ -1,6 +1,6 @@
 ---
 name: summarise-granola
-description: This skill should be used when the user asks to "summarise my call", "summarise my meeting", "summarise my last call", "get granola transcript", "call summary", "meeting summary", or mentions Granola transcripts or summaries. Extracts raw transcripts from Granola and creates custom summaries. (user)
+description: For Granola call or meeting summaries, including "summarise my call", "summarise my meeting", "summarise my last call", "get Granola transcript", "call summary", and similar requests.
 ---
 
 # Granola transcript summarisation
@@ -103,7 +103,9 @@ Use AskUserQuestion with `multiSelect: true`:
 - **"Send call notes email to [Person Name]"** — always show for 1:1 calls
 - **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
 - **"Create tidied transcript"** — always show (off by default). Fire-and-forget background agent that runs AFTER the main workflow finishes (Step 8). Does not block the gdoc insert or the Slack/email send.
-- **"Skip"** — always show, and is the default if the user just hits enter
+- **"Skip"** — always show, and is the default only when the user is explicitly shown the options and submits an empty response; it is not the default when the question was never asked.
+
+**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask the sharing-options question as a normal chat message and STOP until the user answers. Do not start summary generation, project filing, gdoc insertion, email, Slack, or tidied-transcript work before the user has answered. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
 
 **Important:** This question MUST be sent alone (not bundled with Agent or Bash tool calls in the same message). If it's sent in parallel with background agents, the user won't see it until all parallel calls complete, defeating the purpose.
 
@@ -246,7 +248,7 @@ python3 "/Users/ph/Documents/www/Claude Plugins/plugins/plugin--project-manageme
 ```
 
 Filter to only `status: "active"` projects and present options using AskUserQuestion:
-- List each active project as an option (e.g., "80000 Hours advisory")
+- List each active project as an option (e.g., "Acme Consulting")
 - Include a "None" option for calls not associated with any project
 
 **Step 5d: Copy files to project**
@@ -260,8 +262,8 @@ For both auto-associated and manually selected projects:
 
 Example:
 ```bash
-mkdir -p ~/Documents/Projects/2026-01-80000-hours-advisory/calls/summaries
-cp ~/.claude/skills/summarise-granola/data/summaries/2026-01-06-meeting--summary.md ~/Documents/Projects/2026-01-80000-hours-advisory/calls/summaries/
+mkdir -p ~/Documents/Projects/acme-consulting/calls/summaries
+cp ~/.claude/skills/summarise-granola/data/summaries/2026-01-06-meeting--summary.md ~/Documents/Projects/acme-consulting/calls/summaries/
 ```
 
 **Store `{project_dir}` in memory for Step 8** (the tidied transcript agent will handle its own copy into `{project_dir}/calls/transcripts/` when it finishes, to avoid blocking the main workflow).
@@ -397,7 +399,7 @@ cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<messa
 
 1. **Find the person's Slack DM channel:**
    - Check `people.json` for a `slack_dm_channel` field on the person's entry
-   - The field is an object: `{"channel_id": "D...", "workspace": "type3ltd", "slack_connect": true}`
+   - The field is an object: `{"channel_id": "D...", "workspace": "hartreeworks", "slack_connect": true}`
    - If found, use it directly (skip to step 2)
    - If not found, use the Slack skill's `slack_client.py` to search for the person:
      - Run `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> users` and parse the JSON
@@ -423,7 +425,7 @@ cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<messa
 
 4. **Approval behaviour:**
    - If the user selected **"Auto-send when ready"** in Step 2.6b, skip the preview/confirmation and send immediately.
-   - Otherwise, **show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith** on type3ltd?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
+   - Otherwise, **show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith** on hartreeworks?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
 
 5. **Send via Slack** (always pass `--workspace` from the cached entry):
    ```bash
@@ -512,7 +514,7 @@ The registry at `~/.agents/data/people.json` stores per-person metadata: default
 - `full_name` — display name
 - `initials` — lowercase initials for meeting doc lookup (e.g., "js", "ab")
 - `email` — email address for sending call notes (Step 7b), or `null`
-- `slack_dm_channel` — Slack DM details for sending call notes (Step 7c), or `null`. Object with `channel_id`, `workspace` (e.g. "type3ltd", "80000hours"), and `slack_connect` (boolean)
+- `slack_dm_channel` — Slack DM details for sending call notes (Step 7c), or `null`. Object with `channel_id`, `workspace` (e.g. "hartreeworks", "acme-corp"), and `slack_connect` (boolean)
 - `default_project` — project folder name for auto-association (Step 5), or `null`
 - `meeting_doc` — Google Doc reference for call summaries (Step 4), or `null`
 

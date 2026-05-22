@@ -109,9 +109,9 @@ Create comprehensive, chronological summaries that help the user re-envision and
 ```markdown
 ## Part 2: Diagnosing the problem
 
-Alex asked a pivotal question: "Is this a brief issue or an execution of the brief issue?"
+Jane asked a pivotal question: "Is this a brief issue or an execution of the brief issue?"
 
-This opened up a crucial realisation. Alex introduced the "new aesthetics" framing—an emerging visual language for the project.
+This opened up a crucial realisation. Jane introduced the "new aesthetics" framing—an emerging visual language for the project.
 
 The user's reaction was immediate recognition:
 > "We should be at the front of that. In my dream world, if I was leading this, I would have put a lot into trying to be at the front of that."

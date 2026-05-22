@@ -11,6 +11,8 @@ Usage:
 Transcripts are automatically saved to the data/transcripts/ folder.
 """
 
+import base64
+import hashlib
 import json
 import re
 import subprocess
@@ -18,27 +20,174 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SUPABASE_AUTH = Path.home() / "Library" / "Application Support" / "Granola" / "supabase.json"
+GRANOLA_DIR = Path.home() / "Library" / "Application Support" / "Granola"
+STORED_ACCOUNTS = GRANOLA_DIR / "stored-accounts.json"
+SUPABASE_AUTH = GRANOLA_DIR / "supabase.json"
+# Granola 7.2x+ encrypts the token store. The plaintext files above are left
+# stale by newer builds; the live tokens now live in these .enc files, which are
+# AES-256-GCM-encrypted with a data encryption key (DEK) wrapped in storage.dek.
+STORED_ACCOUNTS_ENC = GRANOLA_DIR / "stored-accounts.json.enc"
+SUPABASE_AUTH_ENC = GRANOLA_DIR / "supabase.json.enc"
+DEK_FILE = GRANOLA_DIR / "storage.dek"
+# macOS Keychain service holding the Electron safeStorage key that wraps the DEK.
+KEYCHAIN_SERVICE = "Granola Safe Storage"
 API_BASE = "https://api.granola.ai/v1"
 SKILL_DIR = Path(__file__).parent.parent
 TRANSCRIPTS_DIR = SKILL_DIR / "data" / "transcripts"
 SUMMARIES_DIR = SKILL_DIR / "data" / "summaries"
 
+# Granola's API rejects requests without a client-version header ("Unsupported
+# client"). The desktop app sends its own version; we mirror a known-good one.
+# Bump this if Granola starts rejecting the value.
+GRANOLA_CLIENT_VERSION = "7.162.2"
+
 # How recent a call must be to auto-summarise (in minutes)
 RECENT_THRESHOLD_MINUTES = 30
 
 
-def get_access_token() -> str:
-    """Read the Granola access token from the local auth file."""
+def _parse_stored_accounts(data: dict) -> dict | None:
+    """Extract tokens from a parsed stored-accounts payload (plaintext or decrypted)."""
+    accounts_raw = data.get('accounts')
+    if not accounts_raw:
+        return None
+    accounts = json.loads(accounts_raw) if isinstance(accounts_raw, str) else accounts_raw
+    if not accounts:
+        return None
+    tokens_raw = accounts[0].get('tokens')
+    if not tokens_raw:
+        return None
+    return json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+
+
+def _parse_supabase(data: dict) -> dict | None:
+    """Extract tokens from a parsed supabase payload (plaintext or decrypted)."""
+    return json.loads(data['workos_tokens'])
+
+
+def _tokens_from_stored_accounts() -> dict | None:
+    """Read tokens from stored-accounts.json (legacy plaintext store)."""
+    if not STORED_ACCOUNTS.exists():
+        return None
+    try:
+        return _parse_stored_accounts(json.load(open(STORED_ACCOUNTS)))
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return None
+
+
+def _tokens_from_supabase() -> dict | None:
+    """Read tokens from supabase.json (legacy plaintext store)."""
     if not SUPABASE_AUTH.exists():
-        print(f"Error: Granola auth not found at {SUPABASE_AUTH}", file=sys.stderr)
-        print("Is Granola installed and signed in?", file=sys.stderr)
+        return None
+    try:
+        return _parse_supabase(json.load(open(SUPABASE_AUTH)))
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _aes_cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes:
+    """AES-CBC decrypt, preferring `cryptography`, falling back to pycryptodome."""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        return d.update(ct) + d.finalize()
+    except ImportError:
+        from Crypto.Cipher import AES
+        return AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
+
+
+def _aes_gcm_decrypt(key: bytes, nonce: bytes, ct: bytes, tag: bytes) -> bytes:
+    """AES-GCM decrypt+verify, preferring `cryptography`, falling back to pycryptodome."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        return AESGCM(key).decrypt(nonce, ct + tag, None)
+    except ImportError:
+        from Crypto.Cipher import AES
+        return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
+
+
+def _safestorage_decrypt(blob: bytes) -> bytes:
+    """Decrypt an Electron safeStorage blob.
+
+    On macOS this is `v10` + AES-128-CBC, key = PBKDF2-HMAC-SHA1(keychain_pw,
+    "saltysalt", 1003, 16), IV = 16 spaces. Raises on any failure (e.g. the user
+    declining the Keychain access prompt)."""
+    out = subprocess.run(
+        ["security", "find-generic-password", "-ws", KEYCHAIN_SERVICE],
+        capture_output=True, text=True, timeout=30,
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(f"Keychain lookup failed for {KEYCHAIN_SERVICE!r}")
+    pw = out.stdout.strip()
+    key = hashlib.pbkdf2_hmac("sha1", pw.encode("utf-8"), b"saltysalt", 1003, 16)
+    if blob[:3] in (b"v10", b"v11"):
+        blob = blob[3:]
+    dec = _aes_cbc_decrypt(key, b" " * 16, blob)
+    pad = dec[-1]
+    if 1 <= pad <= 16:
+        dec = dec[:-pad]
+    return dec
+
+
+def _unwrap_dek() -> bytes | None:
+    """Return the 32-byte data encryption key stored (wrapped) in storage.dek."""
+    if not DEK_FILE.exists():
+        return None
+    dek = base64.b64decode(_safestorage_decrypt(DEK_FILE.read_bytes()).decode("utf-8"))
+    return dek if len(dek) == 32 else None
+
+
+def _decrypt_enc_file(path: Path, dek: bytes) -> str:
+    """Decrypt a Granola *.enc payload: [iv:12][ciphertext][tag:16], AES-256-GCM."""
+    data = path.read_bytes()
+    iv, tag, ct = data[:12], data[-16:], data[12:-16]
+    return _aes_gcm_decrypt(dek, iv, ct, tag).decode("utf-8")
+
+
+def _tokens_from_encrypted() -> dict | None:
+    """Decrypt the encrypted token store (Granola 7.2x+) and extract tokens.
+
+    Returns None (rather than raising) on any failure so callers can fall back
+    to the legacy plaintext stores."""
+    try:
+        dek = _unwrap_dek()
+    except Exception:
+        return None
+    if not dek:
+        return None
+    for path, parser in ((STORED_ACCOUNTS_ENC, _parse_stored_accounts),
+                         (SUPABASE_AUTH_ENC, _parse_supabase)):
+        if not path.exists():
+            continue
+        try:
+            tokens = parser(json.loads(_decrypt_enc_file(path, dek)))
+            if tokens and 'access_token' in tokens:
+                return tokens
+        except Exception:
+            continue
+    return None
+
+
+def get_access_token() -> str:
+    """Read the Granola access token.
+
+    Prefers the encrypted store (Granola 7.2x+ keeps the live token there and
+    leaves the plaintext files stale), then falls back to the legacy plaintext
+    stored-accounts.json / supabase.json for older builds."""
+    tokens = (
+        _tokens_from_encrypted()
+        or _tokens_from_stored_accounts()
+        or _tokens_from_supabase()
+    )
+    if not tokens or 'access_token' not in tokens:
+        print(
+            f"Error: Could not read Granola tokens from {GRANOLA_DIR}.\n"
+            "Tried the encrypted store (stored-accounts.json.enc) and the legacy\n"
+            "plaintext files. Is Granola installed and signed in? If decryption is\n"
+            "failing, ensure the `cryptography` (or `pycryptodome`) package is available\n"
+            "and that you allowed the Keychain access prompt.",
+            file=sys.stderr,
+        )
         sys.exit(1)
-
-    with open(SUPABASE_AUTH, 'r') as f:
-        data = json.load(f)
-
-    tokens = json.loads(data['workos_tokens'])
     return tokens['access_token']
 
 
@@ -52,6 +201,7 @@ def api_call(endpoint: str, payload: dict) -> any:
             f'{API_BASE}/{endpoint}',
             '-H', f'Authorization: Bearer {token}',
             '-H', 'Content-Type: application/json',
+            '-H', f'X-Client-Version: {GRANOLA_CLIENT_VERSION}',
             '-d', json.dumps(payload),
         ],
         capture_output=True, text=True,
@@ -62,10 +212,23 @@ def api_call(endpoint: str, payload: dict) -> any:
         sys.exit(1)
 
     try:
-        return json.loads(result.stdout)
+        parsed = json.loads(result.stdout)
     except json.JSONDecodeError:
         print(f"Error: Invalid JSON response: {result.stdout[:200]}", file=sys.stderr)
         sys.exit(1)
+
+    # Granola returns errors as {"message": "..."} with HTTP 200; surface them.
+    if isinstance(parsed, dict) and set(parsed.keys()) == {'message'}:
+        msg = parsed['message']
+        hint = ""
+        if msg == "Unauthorized":
+            hint = " (token may be expired — open Granola.app to refresh)"
+        elif msg == "Unsupported client":
+            hint = f" (bump GRANOLA_CLIENT_VERSION in {Path(__file__).name})"
+        print(f"Error: Granola API: {msg}{hint}", file=sys.stderr)
+        sys.exit(1)
+
+    return parsed
 
 
 def slugify(text: str) -> str:

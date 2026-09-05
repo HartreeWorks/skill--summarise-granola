@@ -1,17 +1,35 @@
 ---
 name: summarise-granola
-description: For Granola call or meeting summaries, including "summarise my call", "summarise my meeting", "summarise my last call", "get Granola transcript", "call summary", and similar requests.
+description: Summarise Granola calls and meeting transcripts.
 ---
 
 # Granola transcript summarisation
 
 This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, files them to the relevant project, and optionally adds the summary + raw transcript to a shared Google Doc (summary → "Call summaries" tab, raw transcript → "Call transcripts" tab), sends call notes via email, or sends them as a Slack DM. A tidied transcript is opt-in and runs in the background after the main workflow.
 
+**Auto-commit:** Every file this skill saves is committed to git automatically. Files written under `data/` (raw transcripts, summaries, tidied transcripts) live in the `~/.agents` repo and are committed **and pushed** to origin; copies filed into a project folder are committed to that project's local-only repo (commit only, no push — and only when that folder is itself a git repo). This is handled by `scripts/autocommit.sh` at Step 5.5 (main workflow) and Step 8 (tidied transcript). No confirmation is needed — committing this working data is always authorised.
+
 **Update check:** Before starting, run `bash ~/.claude/skills/summarise-granola/scripts/check-update.sh`. If it prints output, show the message and ask the user which action to take:
 - **Update now** — run `bash ~/.claude/skills/summarise-granola/scripts/update-skill.sh`, then re-read this SKILL.md before continuing
 - **Remind me tomorrow** — run `bash ~/.claude/skills/summarise-granola/scripts/check-update.sh --snooze`, then continue
 - **Never ask again** — run `bash ~/.claude/skills/summarise-granola/scripts/check-update.sh --disable`, then continue
 If no output, continue silently.
+
+## Setup: Granola API key (one-time)
+
+This skill uses Granola's **official public API** (`https://public-api.granola.ai/v1`), authenticated with a personal API key. It no longer reads Granola's local token/credential store — recent Granola builds encrypt that store behind a key held in an app-entitled macOS Keychain item that no external script can read, so the old approach is permanently broken.
+
+**Generate a key once** (any workspace member on a **Business** plan can):
+1. Granola desktop app → Settings → Connectors → API keys → Create new key. Grant it the **Personal notes** scope (owned or directly-shared notes); add **Public notes** too if you want workspace-visible notes. The key looks like `grn_...`.
+2. Store it (kept outside this skill's git repo so it's never committed):
+   ```bash
+   mkdir -p ~/.config/granola-summarise \
+     && printf 'grn_XXXX' > ~/.config/granola-summarise/api-key \
+     && chmod 600 ~/.config/granola-summarise/api-key
+   ```
+   The `GRANOLA_API_KEY` environment variable overrides the file if set.
+
+If no key is configured, `granola.py` exits with these exact instructions. If the plan doesn't offer API keys, this skill can't run — fall back to pasting the transcript from Granola manually.
 
 ## Workflow
 
@@ -40,6 +58,8 @@ This returns JSON with one of two modes:
 ]}
 ```
 → Present the numbered list to the user and ask which one to summarise. User can reply with just "1", "2", etc.
+
+**Processing delay:** the official API only returns notes that already have a generated AI summary **and** transcript. A call that just ended may not appear in `check`/`list` (or may 404 on `get`) until Granola finishes processing it. If a call the user just finished is missing, wait ~1 minute and retry before assuming it isn't there.
 
 ### Step 2: Extract the transcript
 
@@ -95,35 +115,56 @@ For 1:1 calls where the other participant has a clear name, ask the sharing ques
 
 **Skip this step for:** group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions.
 
-**Step 2.6a: Ask sharing options**
+**Saved defaults (skip or fast-path):** the same person is usually shared with the same way, so check for saved per-person defaults before asking.
 
-Use AskUserQuestion with `multiSelect: true`:
+1. Derive the person key from the confirmed name (lowercase, hyphenated — "Jane Smith" → `jane-smith`) and read any saved defaults:
+   ```bash
+   python3 ~/.claude/skills/summarise-granola/scripts/share_defaults.py get <person-key>
+   python3 ~/.claude/skills/summarise-granola/scripts/share_defaults.py summary <person-key>
+   ```
+   `get` prints the saved choices as JSON (`{}` if none); `summary` prints a one-line label like `doc + Slack DM · no comment · auto-send`.
+2. **If the request asked to reuse defaults** — the invocation or a recent message contains "use share defaults", "use my usual", "usual settings", "use defaults", or similar — AND saved defaults exist: **skip the AskUserQuestion entirely** and apply the saved choices (one exception: if the saved comment is `add_comment`, still ask only for the comment text — the text itself is never stored). Note in the Step 6 report that saved defaults were applied (show the summary label). If nothing is saved yet, fall through to asking.
+3. **If defaults exist but weren't explicitly requested:** offer a one-tap fast-path first — a single-select AskUserQuestion "Use your usual settings for [Name]? (`<summary label>`)" with options **"Use usual settings"** and **"Customise…"**. On "Use usual settings", apply the saved choices and skip the three questions. On "Customise…", ask the three questions below.
+4. **If nothing is saved:** ask the three questions below as normal.
 
+When applying saved defaults, map the tokens back to behaviour: `sharing` → which of doc / email / Slack DM / tidied transcript; `comment: no_comment` → no comment; `comment: add_comment` → still ask for the comment text (the text itself is never stored); `approval: auto_send` → treat as "Auto-send when ready"; `approval: preview` → show a preview first.
+
+**Ask all three questions in a single AskUserQuestion call.** The user nearly always sends via email or Slack, so the flow is built around that assumption: present the sharing, comment, and approval questions together up front rather than asking comment/approval as a slow follow-up round. One round-trip means the answers come back instantly and the rest of the workflow can run unattended. If the user ends up choosing "Skip" for sharing, just ignore the comment and approval answers.
+
+Question 1 — **Sharing** (`multiSelect: true`):
 - **"Add summary + raw transcript to meeting doc"** — always show for 1:1 calls. Inserts the summary into the "Call summaries" tab AND the raw transcript (with speaker labels substituted for the confirmed participant names) into the "Call transcripts" tab.
 - **"Send call notes email to [Person Name]"** — always show for 1:1 calls
 - **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
 - **"Create tidied transcript"** — always show (off by default). Fire-and-forget background agent that runs AFTER the main workflow finishes (Step 8). Does not block the gdoc insert or the Slack/email send.
 - **"Skip"** — always show, and is the default only when the user is explicitly shown the options and submits an empty response; it is not the default when the question was never asked.
 
-**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask the sharing-options question as a normal chat message and STOP until the user answers. Do not start summary generation, project filing, gdoc insertion, email, Slack, or tidied-transcript work before the user has answered. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
-
-**Important:** This question MUST be sent alone (not bundled with Agent or Bash tool calls in the same message). If it's sent in parallel with background agents, the user won't see it until all parallel calls complete, defeating the purpose.
-
-**Step 2.6b: If email or Slack was selected, ask about comment and auto-send**
-
-If the user selected "Send call notes email" or "Send call notes Slack DM" in 2.6a, immediately ask two follow-up questions in a single AskUserQuestion call (before launching agents). This bundles all user-facing prompts up front so the rest of the workflow can run unattended.
-
-Question 1 — **Comment** (single-select):
+Question 2 — **Comment** (single-select):
 - **"No comment"**
 - **"Add a comment"** — the user will type the comment via the free-text option
 
-Question 2 — **Approval** (single-select):
-- **"Auto-send when ready"** — skip the final preview/confirmation and send as soon as the summary and gdoc edit are done
+Question 3 — **Approval** (single-select):
+- **"Auto-send when ready"** — skip the final preview/confirmation and send as soon as the summary and gdoc edit are done. **Keep this exact label** ("Auto-send when ready"): a PostToolUse hook (`autosend-grant.py`) detects it and waves the email send through the bash-safety confirmation, so the auto-send actually sends without a second permission prompt.
 - **"Show preview first"** — show a preview and wait for explicit confirmation before sending
 
-**If the user picks "Auto-send when ready", do NOT ask for confirmation again in Steps 7b or 7c — just send.** The user has pre-authorised the send.
+**If the user picks "Auto-send when ready", do NOT ask for confirmation again in Steps 7b or 7c — just send.** The user has pre-authorised the send, and the security hook is primed to allow it.
+
+**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask the sharing question as a normal chat message and STOP until the user answers. Do not start summary generation, project filing, gdoc insertion, email, Slack, or tidied-transcript work before the user has answered. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
+
+**Important:** This AskUserQuestion call MUST be sent alone (not bundled with Agent or Bash tool calls in the same message). If it's sent in parallel with background agents, the user won't see it until all parallel calls complete, defeating the purpose.
 
 Hold all answers (sharing selections, comment, auto-send preference) for use in Steps 4 and 7.
+
+**Save the choices as defaults.** Whenever the three questions were actually asked (i.e. not skipped via saved defaults) and this is a 1:1 with a clear person, persist the answers so next time can reuse them:
+
+```bash
+python3 ~/.claude/skills/summarise-granola/scripts/share_defaults.py set <person-key> \
+  --sharing "<comma-separated: meeting_doc,email,slack_dm,tidied_transcript>" \
+  --comment <no_comment|add_comment> --approval <auto_send|preview>
+```
+
+On a Skip choice, pass `--sharing ""` with whatever comment/approval the user submitted (or skip the save entirely — a Skip default isn't very useful). This writes `share_defaults` onto the person's registry entry (creating a minimal entry if they aren't registered yet). Because `~/.agents/data/people.json` lives in the `~/.agents` repo, add it to the Step 5.5 autocommit file list (or commit it directly) so the saved default persists across machines.
+
+Defaults accrue only from this normal Step 2.6 flow. The late-ask fallback paths (Steps 4/7b/7c, reached only when participant names were unclear back at Step 2.5) deliberately don't call `set` — that's fine, not an oversight.
 
 ### Step 3: Launch summary agent and pre-fetch (parallel)
 
@@ -188,19 +229,31 @@ Writes `/tmp/gdoc-summary.txt` and `/tmp/gdoc-raw-transcript.txt`. The script st
 
 Decide per tab based on the pre-fetched content from Step 3 (`/tmp/gdoc-summary-tab.txt` and `/tmp/gdoc-transcript-tab.txt`):
 
-1. **Detect the anchor.** Find the first non-blank, non-status line of real content in the tab file. `gdoc cat` prepends lines like `account: default (use --account to switch)` and `--- first interaction with this doc ---` — skip those, plus the ` 📄 "<title>" by <user>, last edited <date>` status line. The **first real content line** (typically `# YYYY-MM-DD` or `# Meeting summary: ...`) is the anchor. If there's no real content line, treat the tab as empty.
+1. **Detect the anchor (`ANCHOR_TEXT`).** The anchor is the first real line of content in the tab — in these docs always a level-1 heading (the previous call's `# YYYY-MM-DD`, or `# Meeting summary: ...`). `gdoc edit` matches against **raw text**, so `ANCHOR_TEXT` must be the heading text *without* the `#`. Read it from the `--plain` export, which is exactly the matchable form regardless of gdoc version (older `gdoc cat` dropped the `#` on read; patched versions keep it — `--plain` sidesteps that entirely). Skip the `account:` / `--- first interaction ---` / ` 📄 …` status lines `gdoc` prepends; the first non-blank line after them is the anchor:
+   ```bash
+   ANCHOR_TEXT=$(gdoc cat --plain <doc_id> --tab "Call summaries" | grep -m1 .)
+   ```
+   If there's no real content line, treat the tab as empty (use the `gdoc insert` path in step 3).
 
 2. **If the tab is populated (anchor found) → use `gdoc edit`:**
-   ```bash
-   # Append the anchor as the final line of the new file so the old anchor is preserved below the new content.
-   printf '\n%s' "$ANCHOR" >> /tmp/gdoc-summary.txt
-   printf -- '%s' "$ANCHOR" > /tmp/gdoc-summary-old.txt   # no trailing newline
 
-   gdoc edit <doc_id> --tab "Call summaries" \
-     --old-file /tmp/gdoc-summary-old.txt \
-     --new-file /tmp/gdoc-summary.txt
+   `gdoc edit` **matches against raw document text** (no markdown — a heading matches as its plain text, so a `#`-prefixed match string returns "no match"), but **renders the replacement as markdown**. So the old-file must be the plain `ANCHOR_TEXT`, while the new-file's trailing anchor must carry the `# ` prefix — otherwise the existing heading is rebuilt as a plain paragraph and **loses its heading style** (a real bug that has happened; the `--plain` read above guarantees `ANCHOR_TEXT` has no stray `#` to leak into the match).
+
+   Run this block **once per tab**, recomputing all three variables each time — `ANCHOR_TEXT` is re-read per tab (step 1) and the two `/tmp` paths differ per tab. For "Call summaries": `NEW_FILE=/tmp/gdoc-summary.txt`, `OLD_FILE=/tmp/gdoc-summary-old.txt`. For "Call transcripts": `NEW_FILE=/tmp/gdoc-raw-transcript.txt`, `OLD_FILE=/tmp/gdoc-transcript-old.txt`, and read the anchor with `--tab "Call transcripts"`.
+
+   ```bash
+   ANCHOR_TEXT=$(gdoc cat --plain <doc_id> --tab "Call summaries" | grep -m1 .)   # matchable text, no leading "# "
+   NEW_FILE=/tmp/gdoc-summary.txt
+   OLD_FILE=/tmp/gdoc-summary-old.txt
+
+   # Trailing anchor in the NEW file keeps the "# " so the old heading stays a heading.
+   printf '\n# %s' "$ANCHOR_TEXT" >> "$NEW_FILE"
+   # OLD file is the PLAIN matchable text (no "# ") so the match succeeds.
+   printf '%s' "$ANCHOR_TEXT" > "$OLD_FILE"   # no trailing newline
+
+   gdoc edit <doc_id> --tab "Call summaries" --old-file "$OLD_FILE" --new-file "$NEW_FILE"
    ```
-   The anchor must match exactly one place in the tab — the first line of existing content is always unique enough.
+   The plain `ANCHOR_TEXT` must match exactly one place in the tab — the first line of existing content is always unique enough. If `gdoc edit` reports more than one match (or zero), stop and inspect rather than forcing it. **After the edit, verify heading preservation** with `gdoc toc <doc_id> --tab "Call summaries"`: both the new `YYYY-MM-DD` and the previous anchor date must still appear as headings. If the previous date is missing from the TOC, the trailing `# ` was dropped. To re-run, **first regenerate the new file via Step 4b** (`prepare_gdoc_inserts.py`) — the `>>` append is destructive on repeat and would otherwise stack a second trailing anchor — then redo the printf + `gdoc edit` block.
 
 3. **If the tab is empty or absent → use `gdoc insert`:**
    ```bash
@@ -241,13 +294,13 @@ If found in the registry:
 
 **Step 5c: If person is NOT registered → show project list**
 
-If not found in the registry, fall back to the full project selection:
+If not found in the registry, fall back to the full project selection. Read the central project index:
 
 ```bash
-python3 "/Users/ph/Documents/www/Claude Plugins/plugins/plugin--project-management/scripts/list_projects.py" --format json
+cat ~/Documents/Projects/projects.yaml
 ```
 
-Filter to only `status: "active"` projects and present options using AskUserQuestion:
+Filter to only `status: active` projects and present options using AskUserQuestion:
 - List each active project as an option (e.g., "Acme Consulting")
 - Include a "None" option for calls not associated with any project
 
@@ -277,6 +330,26 @@ If the user selected a project for someone NOT in the registry, offer to add the
 If yes, update `people.json` to add or update the entry with the `default_project` value. If Step 4 cached a `meeting_doc` for this person but the rest of the entry wasn't created yet, include that too.
 
 **If user selects "None":** No additional action needed, and don't offer registration.
+
+### Step 5.5: Auto-commit saved data and project files
+
+**Always run this**, right after the summary is saved and any project copy is made — even when the call was not associated with a project (the `data/` files must still be committed).
+
+Pass every file that now exists to the autocommit helper in a single call:
+
+```bash
+bash ~/.claude/skills/summarise-granola/scripts/autocommit.sh \
+  -m "granola: {slug} — transcript + summary" \
+  ~/.claude/skills/summarise-granola/data/transcripts/{slug}.md \
+  ~/.claude/skills/summarise-granola/data/summaries/{slug}--summary.md \
+  {project_dir}/calls/summaries/{slug}--summary.md
+```
+
+- The **raw transcript** and **summary** (both under `data/`) resolve to the `~/.agents` repo — committed and pushed to origin.
+- The **project summary copy** resolves to the project's own repo — committed only (project repos are local-only, no remote).
+- **Include the project-copy path only if Step 5 associated a project.** If the user chose "None" (or the person wasn't matched), omit that third path and commit just the two `data/` files.
+
+The helper groups files by their owning git repo, resolves the `~/.claude` → `~/.agents` symlink, skips any files that are missing/gitignored/not in a repo, commits only the given paths (never sweeping other staged changes), makes no empty commits, and treats a push hiccup as non-fatal. It prints one line per repo to stderr: `committed in <root>`, `pushed <root>`, `nothing to commit in <root>`, or a failure line. **Report the Step 6 outcome from what the helper actually printed** — don't assume success. E.g. if it printed `committed in .../.agents` + `pushed` and `committed in .../coaching-jane`, report "Committed to `~/.agents` (pushed) + `coaching-jane`"; if a repo printed a failure/skip line, say so.
 
 ### Step 6: Report saved files and open them
 
@@ -331,7 +404,7 @@ If the user selects only "Skip", stop here.
 
 **Step 7b: Send call notes email** (if selected)
 
-**IMPORTANT:** Always use the `send-email` skill (Node.js script) for sending emails.
+**IMPORTANT:** Always use `gog gmail send` for sending emails (see `~/.agents/references/gog-cli.md`).
 
 **a) Find the attendee's email address:**
 
@@ -352,18 +425,16 @@ If the user selects only "Skip", stop here.
 
 **b) Comment:**
 
-Use the comment answer collected in Step 2.6b. Do NOT ask again. If Step 2.6b was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion:
+Use the comment answer collected in Step 2.6. Do NOT ask again. If Step 2.6 was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion:
 
 > "Would you like to add a comment to the call notes email?"
 
 - Provide a "No comment" option and a free-text "Add a comment" option
 
-**c) Send the email using the send-email skill:**
-
-Use the send-email skill's Node.js script directly:
+**c) Send the email using `gog gmail send`:**
 
 ```bash
-cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<message>"
+gog gmail send --to "<to>" --subject "Call notes" --body "<message>" --account your-email@gmail.com
 ```
 
 - **To:** the attendee's email address
@@ -392,22 +463,28 @@ cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<messa
   ```
 
 **Approval behaviour:**
-- If the user selected **"Auto-send when ready"** in Step 2.6b, skip the preview/confirmation and send immediately.
+- If the user selected **"Auto-send when ready"** in Step 2.6, skip the preview/confirmation and send immediately.
 - Otherwise, show the user a preview of the email and ask for confirmation before sending.
 
 **Step 7c: Send call notes via Slack DM** (if selected)
 
 1. **Find the person's Slack DM channel:**
    - Check `people.json` for a `slack_dm_channel` field on the person's entry
-   - The field is an object: `{"channel_id": "D...", "workspace": "hartreeworks", "slack_connect": true}`
-   - If found, use it directly (skip to step 2)
-   - If not found, use the Slack skill's `slack_client.py` to search for the person:
-     - Run `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> users` and parse the JSON
-     - **Full name verification (CRITICAL):** Match against `real_name` (full name), NOT just `name` or first name. The person's full name from the meeting title must exactly match a workspace member's `real_name`. If no exact full-name match is found, do NOT proceed—ask the user to identify the correct person. This prevents sending messages to the wrong person when multiple users share a first name.
-     - Once the correct user is identified, find their DM channel via `python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <ws> channels "im"` and match by user ID
-   - Cache the full object in `people.json` under the person's `slack_dm_channel` field for future use
+   - The field is an object containing `channel_id`, `workspace`, `slack_connect`, and verified identity metadata (`user_id`, `verified_real_name`, `verified_email`, `verification_source`, `verified_for`, `verified_at`)
+   - **Never treat a cached channel ID as proof of identity.** Before every send, resolve the channel in its cached workspace via the Slack launcher (`~/.agents/skills/slack/scripts/slack -w <workspace> channels "im"`) and get its current `user` ID.
+   - For ordinary workspace users, resolve that user via `... -w <workspace> users`. For `slack_connect: true`, follow the Slack skill's Slack Connect workflow instead: inspect DM history for a message from the channel's current `user` ID and use its embedded `user_profile`. If no attributable embedded profile is available, stop and ask the user rather than sending.
+   - Accept the channel only when one of these checks passes:
+     1. The live profile's `real_name` exactly matches the confirmed participant's full name, and the Slack skill's cross-workspace/Slack-Connect ambiguity check finds no other exact match.
+     2. The current channel user ID, live `real_name`, and live email all match the entry's `user_id`, `verified_real_name`, and `verified_email`; `verification_source` is `"user"`; and `verified_for` exactly matches the current registry person key. If Slack does not expose an email for this user, stop and ask rather than treating the missing value as a match.
+     3. The user explicitly supplied or confirmed this channel for this participant in the current conversation; record the resolved identity metadata before sending.
+   - A first-name-only profile, a matching first name, or a cached `channel_id` without verified identity metadata is insufficient. If the workspace or profile conflicts with known context (for example, an employee of one organisation mapped to a different organisation's workspace), stop and ask even if another check appears to pass.
+   - If no usable cached mapping exists, search for the person:
+     - Run `~/.agents/skills/slack/scripts/slack -w <workspace> users` and parse the JSON. Always use the launcher, not `slack_client.py` directly.
+     - **Full name verification (CRITICAL):** Match against `real_name` (full name), NOT just `name`, display name, or first name. The person's full name from the meeting title must exactly match a workspace member's `real_name`. If no exact full-name match is found, do NOT proceed—ask the user to identify the correct person.
+     - Once the correct user is identified, find their DM channel via `~/.agents/skills/slack/scripts/slack -w <workspace> channels "im"` and match by user ID.
+   - Cache the channel plus resolved `user_id`, `verified_real_name`, `verified_email`, `verification_source` (`"exact_name"` or `"user"`), `verified_for` (the registry person key), and `verified_at` in `people.json`. Only mark a non-exact-name mapping as `"user"` after explicit user confirmation for that exact registry person.
 
-2. **Comment:** use the comment answer collected in Step 2.6b. Do NOT ask again. If Step 2.6b was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion: "Would you like to add a comment to the Slack DM?" with a "No comment" option and a free-text "Add a comment" option.
+2. **Comment:** use the comment answer collected in Step 2.6. Do NOT ask again. If Step 2.6 was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion: "Would you like to add a comment to the Slack DM?" with a "No comment" option and a free-text "Add a comment" option.
 
 3. **Compose message** using Slack mrkdwn formatting — keep it brief (no greeting or sign-off):
    - **Without comment:**
@@ -424,12 +501,12 @@ cd ~/.agents/skills/send-email && node send-email.js "<to>" "Call notes" "<messa
      ```
 
 4. **Approval behaviour:**
-   - If the user selected **"Auto-send when ready"** in Step 2.6b, skip the preview/confirmation and send immediately.
+   - If the user selected **"Auto-send when ready"** in Step 2.6, skip the preview/confirmation and send immediately.
    - Otherwise, **show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith** on hartreeworks?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
 
-5. **Send via Slack** (always pass `--workspace` from the cached entry):
+5. **Send via Slack** (always pass the workspace from the cached entry and use the launcher):
    ```bash
-   python3 ~/.agents/skills/slack/scripts/slack_client.py --workspace <workspace> send "<channel_id>" "<message>"
+   ~/.agents/skills/slack/scripts/slack -w <workspace> send "<channel_id>" "<message>"
    ```
 
 6. Report success or failure to the user.
@@ -447,9 +524,17 @@ Before launching, `Read` `references/tidying-instructions.md` and paste its cont
 Include:
 1. The **full raw transcript text** (paste inline from `data/transcripts/{slug}.md`).
 2. The **confirmed participant names** from Step 2.5.
-3. Instruction to write the tidied transcript to: `/Users/ph/.claude/skills/summarise-granola/data/tidied-transcripts/{slug}--transcript.md`
-4. If a project folder was determined in Step 5, also instruct the agent to copy the final file to: `/Users/ph/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md` (after creating the parent directory with `mkdir -p`).
+3. Instruction to write the tidied transcript to: `~/.claude/skills/summarise-granola/data/tidied-transcripts/{slug}--transcript.md`
+4. If a project folder was determined in Step 5, also instruct the agent to copy the final file to: `~/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md` (after creating the parent directory with `mkdir -p`).
 5. The tidying guidelines from `references/tidying-instructions.md` (pasted verbatim).
+6. Instruction to **auto-commit** the tidied transcript once written (and copied). Because this agent runs in the background after the main workflow, it must commit its own output — the main loop is no longer around to do it. Run:
+   ```bash
+   bash ~/.claude/skills/summarise-granola/scripts/autocommit.sh \
+     -m "granola: {slug} — tidied transcript" \
+     ~/.claude/skills/summarise-granola/data/tidied-transcripts/{slug}--transcript.md \
+     ~/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md
+   ```
+   Omit the second path if no project folder was determined. The helper commits the `data/` file to `~/.agents` (and pushes) and commits the project copy to the local-only project repo.
 
 ## File locations
 
@@ -461,6 +546,8 @@ Files use the pattern:
 - Raw transcripts: `YYYY-MM-DD-meeting-title-slug.md`
 - Tidied transcripts: `YYYY-MM-DD-meeting-title-slug--transcript.md`
 - Summaries: `YYYY-MM-DD-meeting-title-slug--summary.md`
+
+The `data/` directory is inside the `~/.agents` git repo. All files written here — and any project-folder copies — are auto-committed by `scripts/autocommit.sh` (see the auto-commit note at the top, Step 5.5, and Step 8). `~/.agents` commits are also pushed to origin; project-repo commits are local-only.
 
 ## Transcript format
 
@@ -479,6 +566,12 @@ Replace "YOUR_NAME" with the user's actual name. Always use their preferred name
 | `list` | List all meetings with transcripts |
 | `get <id>` | Get transcript by document ID |
 | `recent [n]` | Get nth most recent transcript (default: 1) |
+
+**Helper scripts:**
+
+| Script | Description |
+|--------|-------------|
+| `scripts/autocommit.sh -m "msg" FILE...` | Commit each file into its owning git repo (groups by repo root); pushes repos that have an `origin` remote (→ `~/.agents`), commits local-only project repos without pushing. Skips missing/gitignored files, makes no empty commits, push failures non-fatal. `--no-push` to commit without pushing. |
 
 ## Tips
 
@@ -514,7 +607,7 @@ The registry at `~/.agents/data/people.json` stores per-person metadata: default
 - `full_name` — display name
 - `initials` — lowercase initials for meeting doc lookup (e.g., "js", "ab")
 - `email` — email address for sending call notes (Step 7b), or `null`
-- `slack_dm_channel` — Slack DM details for sending call notes (Step 7c), or `null`. Object with `channel_id`, `workspace` (e.g. "hartreeworks", "acme-corp"), and `slack_connect` (boolean)
+- `slack_dm_channel` — Slack DM details for sending call notes (Step 7c), or `null`. Object with `channel_id`, `workspace` (e.g. "hartreeworks", "acme-corp"), `slack_connect` (boolean), `user_id`, `verified_real_name`, `verified_email`, `verification_source` (`"exact_name"` or `"user"`), `verified_for` (the registry person key), and `verified_at`. Before every send, re-resolve the channel and apply Step 7c's three acceptance paths; user-confirmed alias mappings require the live user ID, name, and email to match the stored identity.
 - `default_project` — project folder name for auto-association (Step 5), or `null`
 - `meeting_doc` — Google Doc reference for call summaries (Step 4), or `null`
 

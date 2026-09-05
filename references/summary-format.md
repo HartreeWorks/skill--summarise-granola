@@ -15,7 +15,10 @@ Create comprehensive, chronological summaries that help the user re-envision and
 
 ## Summary
 
-[3-5 sentence overview of what the call was about and what was concluded. If listing items, use a numbered list with each item on its own line.]
+- [First key point from the call.]
+- [Second key point from the call.]
+- [Third key point from the call.]
+- [Fourth key point from the call, if needed.]
 
 ---
 
@@ -76,6 +79,12 @@ Create comprehensive, chronological summaries that help the user re-envision and
 - Use **lettered lists (a, b, c)** when you don't want to imply prioritisation
 - Use **bullet lists** only for items that won't need to be referenced
 - Always put each list item on its own line (no inline numbered lists)
+
+**Top summary section:**
+- The `## Summary` section must be a bullet list of 3-5 key points, not a continuous paragraph.
+- Keep this bullet-list treatment to the `## Summary` section only. Later `## Part...` sections should remain chronological prose unless a local list is genuinely useful.
+- Each summary bullet should cover one major point from the call. Prefer one short sentence; use 2-3 short sentences when the point needs more detail.
+- Avoid long compound sentences in the summary bullets. Split them so each sentence is easy to scan.
 
 **Quotations:**
 - Use inline "quotation marks" for short, key phrases within prose

@@ -62,8 +62,14 @@ REMOTE_VERSION=$(curl -sf --max-time 3 \
   "https://raw.githubusercontent.com/${REPO}/main/VERSION" 2>/dev/null \
   | tr -d '[:space:]' || echo "")
 
+# True only when $1 is a strictly newer version than $2 (dotted numeric compare).
+# A local version ahead of remote (unpublished changes) must not trigger a nag.
+is_newer() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
 # Compare and cache result (cache even on fetch failure to avoid unnecessary requests)
-if [ -n "$REMOTE_VERSION" ] && [ "$REMOTE_VERSION" != "$LOCAL_VERSION" ]; then
+if [ -n "$REMOTE_VERSION" ] && is_newer "$REMOTE_VERSION" "$LOCAL_VERSION"; then
   MSG="[skill-update] ${SKILL_NAME}: update available (${LOCAL_VERSION} → ${REMOTE_VERSION}). See https://github.com/${REPO}"
   echo "$MSG"
   echo "$MSG" > "$CACHE_FILE"
